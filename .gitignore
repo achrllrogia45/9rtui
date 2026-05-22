@@ -1,0 +1,39 @@
+# local/runtime data
+.accounts/
+.tui-logs/
+.dev/
+.reports/
+9rtui.ini
+.env
+web.pid
+.9router
+.hermes/
+
+# old runtime dirs (pre-dot migration)
+accounts/
+tui-logs/
+dev/
+reports/
+
+# generated reports
+DB-HEALTH-CHECK.md
+FIX-SUMMARY.md
+*.report.md
+
+# databases/backups/logs
+*.sqlite
+*.sqlite-*
+*.sqlite.bak
+*.sqlite.bak2
+*.db
+*.db-*
+*.log
+
+# builds/temp
+9rtui
+9rtui.exe
+9rtui.backup
+tmp/
+coverage/
+dist/
+build/

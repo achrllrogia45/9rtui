@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>9rtui web terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <style>
+    html,body{height:100%;margin:0;background:#05070a;color:#e5e7eb;font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;overflow:hidden}
+    #bar{height:42px;display:flex;align-items:center;gap:10px;padding:0 12px;background:#0b1220;border-bottom:1px solid #1f2937}
+    #brand{font-weight:800;color:#93c5fd}#status{font-size:13px;color:#94a3b8;flex:1}
+    button{background:#1f2937;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:7px 10px;cursor:pointer}
+    button:hover{background:#334155}
+    #terminal{height:calc(100% - 42px);width:100%}
+  </style>
+</head>
+<body>
+  <div id="bar"><span id="brand">9rtui</span><span id="status">connecting...</span><button onclick="logout()">Logout</button></div>
+  <div id="terminal"></div>
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <script>
+    const term = new Terminal({cursorBlink:true, fontFamily:'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace', fontSize:14, theme:{background:'#05070a'}});
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById('terminal'));
+    fit.fit();
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const ws = new WebSocket(proto + location.host + '/ws');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { document.getElementById('status').textContent='connected'; term.focus(); };
+    ws.onclose = () => { document.getElementById('status').textContent='disconnected'; };
+    ws.onerror = () => { document.getElementById('status').textContent='error'; };
+    ws.onmessage = ev => {
+      if (ev.data instanceof ArrayBuffer) term.write(new Uint8Array(ev.data));
+      else term.write(ev.data);
+    };
+    term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+    addEventListener('resize', () => fit.fit());
+    function logout(){ location.href='/logout'; }
+  </script>
+</body>
+</html>

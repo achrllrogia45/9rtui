@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>9rtui login</title>
+  <style>
+    body{margin:0;min-height:100vh;background:#05070a;color:#e5e7eb;font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;display:grid;place-items:center}
+    .card{width:min(92vw,420px);background:#0b1220;border:1px solid #1f2937;border-radius:18px;padding:28px;box-shadow:0 20px 60px #0008}
+    h1{margin:0 0 10px;font-size:24px}.muted{color:#94a3b8;font-size:14px;line-height:1.45}
+    input{width:100%;box-sizing:border-box;margin:18px 0 12px;padding:14px 16px;border-radius:12px;border:1px solid #334155;background:#020617;color:#f8fafc;font-size:16px}
+    button{width:100%;padding:13px 16px;border:0;border-radius:12px;background:#2563eb;color:white;font-weight:700;font-size:15px;cursor:pointer}
+    code{background:#111827;border:1px solid #374151;border-radius:6px;padding:2px 5px;color:#c4b5fd}
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/login">
+    <h1>9rtui web</h1>
+    <div class="muted">Enter web password. Cookie stays on this browser/device only.</div>
+    <input name="password" type="text" placeholder="Web key" autofocus autocomplete="off" spellcheck="false" />
+    <button type="submit">Login</button>
+    <p class="muted">Forgot password? Delete or edit <code>~/.9rtui/.env</code>, then restart <code>9rtui web</code>.</p>
+  </form>
+</body>
+</html>
