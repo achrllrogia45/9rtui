@@ -20,7 +20,7 @@
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <script>
-    const term = new Terminal({cursorBlink:true, fontFamily:'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace', fontSize:14, theme:{background:'#05070a'}});
+    const term = new Terminal({cursorBlink:true, fontFamily:'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace', fontSize:14, theme:{background:'#05070a', foreground:'#e5e7eb', cursor:'#e5e7eb'}});
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     term.open(document.getElementById('terminal'));
@@ -28,7 +28,11 @@
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     const ws = new WebSocket(proto + location.host + '/ws');
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { document.getElementById('status').textContent='connected'; term.focus(); };
+    function sendResize(){
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send('__9RTUI_RESIZE__' + JSON.stringify({cols: term.cols, rows: term.rows}));
+    }
+    ws.onopen = () => { document.getElementById('status').textContent='connected'; term.focus(); sendResize(); };
     ws.onclose = () => { document.getElementById('status').textContent='disconnected'; };
     ws.onerror = () => { document.getElementById('status').textContent='error'; };
     ws.onmessage = ev => {
@@ -36,7 +40,7 @@
       else term.write(ev.data);
     };
     term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
-    addEventListener('resize', () => fit.fit());
+    addEventListener('resize', () => { fit.fit(); sendResize(); });
     function logout(){ location.href='/logout'; }
   </script>
 </body>

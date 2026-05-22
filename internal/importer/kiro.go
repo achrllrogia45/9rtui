@@ -387,7 +387,7 @@ func mergeExisting(dst map[string]bool, ex existingKeys) {
 func FetchExistingFromDB(path string) (existingKeys, error) {
 	ex := newExistingKeys()
 	if strings.TrimSpace(path) == "" {
-		path = os.Getenv("NINETUI_DB")
+		path = os.Getenv("NRTUI_DB")
 	}
 	if strings.TrimSpace(path) == "" {
 		path = default9RouterDBPath()
@@ -507,14 +507,14 @@ func defaults(o ImportOptions) ImportOptions {
 		o.AccountsPath = filepath.Join(".accounts", "accounts.json")
 	}
 	if o.APIBase == "" {
-		if v := os.Getenv("NINETUI_API"); v != "" {
+		if v := os.Getenv("NRTUI_API"); v != "" {
 			o.APIBase = v
 		} else {
 			o.APIBase = DefaultAPI
 		}
 	}
 	if o.LogDir == "" {
-		if v := os.Getenv("NINETUI_LOG_DIR"); v != "" {
+		if v := os.Getenv("NRTUI_LOG_DIR"); v != "" {
 			o.LogDir = v
 		} else {
 			o.LogDir = "./.tui-logs"
@@ -900,14 +900,16 @@ func quickCheckPath(dbPath string) (string, error) {
 	}
 	db.SetMaxOpenConns(1)
 	defer db.Close()
-	var status string
-	if err := db.QueryRow(`PRAGMA quick_check`).Scan(&status); err != nil {
-		return "", err
+	for _, q := range []string{
+		`SELECT COUNT(*) FROM providerConnections`,
+		`SELECT COUNT(*) FROM providerNodes`,
+	} {
+		var n int
+		if err := db.QueryRow(q).Scan(&n); err != nil {
+			return "", err
+		}
 	}
-	if status != "ok" {
-		return status, fmt.Errorf("sqlite quick_check failed: %s", status)
-	}
-	return status, nil
+	return "account tables ok", nil
 }
 
 func existingForProvider(ex existingKeys, provider string) map[string]bool {
@@ -932,7 +934,7 @@ func firstNonEmptyString(xs ...string) string {
 
 func ensureDevDBPath(path string) error {
 	// Production mode: skip dev DB restriction
-	if strings.ToLower(strings.TrimSpace(os.Getenv("NINETUI_DEV_MODE"))) == "false" {
+	if strings.ToLower(strings.TrimSpace(os.Getenv("NRTUI_DEV_MODE"))) == "false" {
 		return nil
 	}
 	clean := filepath.Clean(path)

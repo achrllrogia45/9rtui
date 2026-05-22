@@ -43,14 +43,14 @@ func sqliteFileDSN(path, query string) string {
 }
 
 func defaultLogDir() string {
-	if v := os.Getenv("NINETUI_LOG_DIR"); v != "" {
+	if v := os.Getenv("NRTUI_LOG_DIR"); v != "" {
 		return v
 	}
 	return "./.tui-logs"
 }
 
 func defaultAccountsDir() string {
-	if v := os.Getenv("NINETUI_ACCOUNTS_PATH"); v != "" {
+	if v := os.Getenv("NRTUI_ACCOUNTS_PATH"); v != "" {
 		return strings.TrimRight(v, string(os.PathSeparator))
 	}
 	return "./.accounts"
@@ -93,7 +93,7 @@ func (r *Repo) ListAccounts() ([]domain.Account, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT id, provider, authType, COALESCE(name,''), COALESCE(email,''), COALESCE(priority,0), COALESCE(isActive,0), createdAt, updatedAt FROM providerConnections ORDER BY provider, priority, name`)
+	rows, err := db.Query(`SELECT id, provider, authType, COALESCE(name,''), COALESCE(email,''), COALESCE(priority,0), COALESCE(isActive,0), createdAt, updatedAt FROM providerConnections NOT INDEXED ORDER BY provider, priority, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +140,7 @@ func (r *Repo) GetAccount(id string) (domain.AccountExport, error) {
 	}
 	defer db.Close()
 	var x accountRow
-	if err := db.QueryRow(`SELECT id, provider, authType, COALESCE(name,''), COALESCE(email,''), COALESCE(priority,0), COALESCE(isActive,0), data, createdAt, updatedAt FROM providerConnections WHERE id = ?`, id).Scan(&x.ID, &x.Provider, &x.AuthType, &x.Name, &x.Email, &x.Priority, &x.IsActive, &x.Data, &x.CreatedAt, &x.UpdatedAt); err != nil {
+	if err := db.QueryRow(`SELECT id, provider, authType, COALESCE(name,''), COALESCE(email,''), COALESCE(priority,0), COALESCE(isActive,0), data, createdAt, updatedAt FROM providerConnections NOT INDEXED WHERE id = ?`, id).Scan(&x.ID, &x.Provider, &x.AuthType, &x.Name, &x.Email, &x.Priority, &x.IsActive, &x.Data, &x.CreatedAt, &x.UpdatedAt); err != nil {
 		return domain.AccountExport{}, err
 	}
 	var data any
@@ -200,7 +200,7 @@ func (r *Repo) ExportAccount(id string) (string, error) {
 }
 
 func (r *Repo) readRows(tx *sql.Tx, ids []string) ([]accountRow, error) {
-	stmt, err := tx.Prepare(`SELECT id, provider, authType, COALESCE(name,''), COALESCE(email,''), COALESCE(priority,0), COALESCE(isActive,0), data, createdAt, updatedAt FROM providerConnections WHERE id = ?`)
+	stmt, err := tx.Prepare(`SELECT id, provider, authType, COALESCE(name,''), COALESCE(email,''), COALESCE(priority,0), COALESCE(isActive,0), data, createdAt, updatedAt FROM providerConnections NOT INDEXED WHERE id = ?`)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +274,7 @@ func (r *Repo) SetAccountsActive(ids []string, active bool) (int64, error) {
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	if err := quickCheck(db); err != nil {
+	if err := accountCheck(db); err != nil {
 		return total, err
 	}
 	return total, nil
@@ -324,7 +324,7 @@ func (r *Repo) DeleteAccounts(ids []string) (int64, error) {
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	if err := quickCheck(db); err != nil {
+	if err := accountCheck(db); err != nil {
 		return total, err
 	}
 	return total, nil
@@ -332,7 +332,7 @@ func (r *Repo) DeleteAccounts(ids []string) (int64, error) {
 
 func ensureDevDBPath(path string) error {
 	// Production mode: skip dev DB restriction
-	if strings.ToLower(strings.TrimSpace(os.Getenv("NINETUI_DEV_MODE"))) == "false" {
+	if strings.ToLower(strings.TrimSpace(os.Getenv("NRTUI_DEV_MODE"))) == "false" {
 		return nil
 	}
 	clean := filepath.Clean(path)
@@ -350,6 +350,22 @@ func quickCheck(db *sql.DB) error {
 	}
 	if status != "ok" {
 		return fmt.Errorf("sqlite quick_check failed: %s", status)
+	}
+	return nil
+}
+
+func accountCheck(db *sql.DB) error {
+	// 9Router can have corruption in huge telemetry tables (requestDetails/usageHistory)
+	// while account tables remain readable. Account actions should verify account-critical
+	// tables instead of failing writes because unrelated log/history btrees are damaged.
+	for _, q := range []string{
+		`SELECT COUNT(*) FROM providerConnections`,
+		`SELECT COUNT(*) FROM providerNodes`,
+	} {
+		var n int
+		if err := db.QueryRow(q).Scan(&n); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -377,8 +393,12 @@ func (r *Repo) UndoLogs() ([]UndoInfo, error) {
 			continue
 		}
 		var log UndoLog
-		if json.Unmarshal(b, &log) != nil {
-			continue
+		if err := json.Unmarshal(b, &log); err != nil || len(log.Rows) == 0 {
+			var rows []accountRow
+			if err2 := json.Unmarshal(b, &rows); err2 != nil || len(rows) == 0 {
+				continue
+			}
+			log.Rows = rows
 		}
 		info := UndoInfo{Path: p, Modified: st.ModTime().Format(time.RFC3339), Size: st.Size(), Accounts: len(log.Rows), ProviderCount: map[string]int{}}
 		for _, row := range log.Rows {

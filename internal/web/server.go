@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -104,10 +105,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		exe = real
 	}
 	cmd := exec.Command(exe, "tui")
-	cmd.Env = append(os.Environ(), "NINETUI_DB="+s.cfg.DBPath)
+	cmd.Env = append(os.Environ(), "NRTUI_DB="+s.cfg.DBPath, "NRTUI_WEB=1", "TERM=xterm-256color")
 	ptyFile, err := startPTY(cmd)
 	if err != nil {
-		_ = conn.WriteMessage(websocket.TextMessage, []byte("failed to start TUI: "+err.Error()))
+		writeUnsupportedScreen(conn, err)
 		return
 	}
 	defer ptyFile.Close()
@@ -131,11 +132,31 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		if strings.TrimSpace(string(data)) == "\x04" {
+		text := string(data)
+		if strings.TrimSpace(text) == "\x04" {
 			return
+		}
+		if strings.HasPrefix(text, "__9RTUI_RESIZE__") {
+			var msg struct{ Cols, Rows int }
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(text, "__9RTUI_RESIZE__")), &msg); err == nil {
+				_ = resizePTY(ptyFile, msg.Cols, msg.Rows)
+			}
+			continue
 		}
 		_, _ = ptyFile.Write(data)
 	}
+}
+
+func writeUnsupportedScreen(conn *websocket.Conn, cause error) {
+	msg := "\x1b[2J\x1b[H" +
+		"+------------------------------------------------------+\r\n" +
+		"| 9rtui web terminal                                  |\r\n" +
+		"+------------------------------------------------------+\r\n\r\n" +
+		"Windows web terminal is not supported yet.\r\n" +
+		"Use native 9rtui.exe TUI. Linux/macOS web works.\r\n\r\n" +
+		"Detail: " + cause.Error() + "\r\n"
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	time.Sleep(500 * time.Millisecond)
 }
 
 func WritePID(appDir string, port int) error {

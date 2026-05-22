@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,8 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/9rtui/9rtui/internal/importer"
-	"github.com/9rtui/9rtui/internal/repo"
 	"github.com/9rtui/9rtui/internal/tui"
 	"github.com/9rtui/9rtui/internal/web"
 	tea "github.com/charmbracelet/bubbletea"
@@ -30,11 +29,24 @@ var version = "dev"
 var commit = "unknown"
 var buildDate = "unknown"
 
+func portFlagPresent(args []string) bool {
+	for i, a := range args {
+		if a == "--port" || a == "-port" {
+			return i+1 < len(args)
+		}
+		if strings.HasPrefix(a, "--port=") || strings.HasPrefix(a, "-port=") {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	port := flag.Int("port", 20129, "web server port")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	showVersionShort := flag.Bool("v", false, "print version and exit")
 	flag.Usage = usage
+	portOnlyWeb := portFlagPresent(os.Args[1:])
 	flag.Parse()
 	args := flag.Args()
 	if err := migrateLocalDirs(appDir); err != nil {
@@ -79,19 +91,21 @@ func main() {
 			}
 			fmt.Println("DB OK:", db)
 			return
-		case "import-file":
-			handleImportFile(args[1:], db)
-			return
-		case "export":
-			handleExport(args[1:], db)
-			return
 		case "restart":
 			_ = web.StopHard(appDir)
 			handleWeb([]string{"start"}, *port, db)
 			return
+		default:
+			fmt.Fprintln(os.Stderr, "unknown command:", args[0])
+			usage()
+			os.Exit(2)
 		}
 	}
 	_ = cfg
+	if len(args) == 0 && portOnlyWeb {
+		handleWeb(nil, *port, db)
+		return
+	}
 	runTUI(db)
 }
 
@@ -108,8 +122,6 @@ func usage() {
 	fmt.Fprintln(out, "  9rtui web expose              run web TUI at 0.0.0.0:20129")
 	fmt.Fprintln(out, "  9rtui stop                    hard-stop all running 9rtui web servers")
 	fmt.Fprintln(out, "  9rtui check-db                verify configured 9Router DB")
-	fmt.Fprintln(out, "  9rtui import-file -provider kiro -file accounts.json")
-	fmt.Fprintln(out, "  9rtui export [-provider kiro] export account JSON to .accounts")
 	fmt.Fprintln(out, "  9rtui web stop                alias for stop")
 	fmt.Fprintln(out, "  9rtui web restart             restart web server")
 	fmt.Fprintln(out, "  9rtui restart                 restart web server")
@@ -128,53 +140,6 @@ func printConfig(cfg map[string]string, db string) {
 	fmt.Println("version:", version)
 	fmt.Println("commit:", commit)
 	fmt.Println("built:", buildDate)
-}
-
-func handleImportFile(args []string, dbPath string) {
-	fs := flag.NewFlagSet("import-file", flag.ExitOnError)
-	provider := fs.String("provider", "kiro", "provider name")
-	file := fs.String("file", "", "account JSON file")
-	dryRun := fs.Bool("dry-run", false, "preview without writing")
-	limit := fs.Int("limit", 0, "max rows to import")
-	_ = fs.Parse(args)
-	if strings.TrimSpace(*file) == "" {
-		fmt.Fprintln(os.Stderr, "import-file requires -file")
-		os.Exit(2)
-	}
-	res, err := importer.RunProvider(context.Background(), importer.ImportOptions{AccountsPath: *file, DBPath: dbPath, DoImport: !*dryRun, DryRun: *dryRun, IncludeInactive: true, Limit: *limit}, *provider)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "import failed:", err)
-		os.Exit(1)
-	}
-	fmt.Printf("selected=%d ok=%d fail=%d skipped=%d db=%s log=%s\n", res.Selected, res.OK, res.Fail, res.Skipped, res.DBCheck, res.LogPath)
-}
-
-func handleExport(args []string, dbPath string) {
-	fs := flag.NewFlagSet("export", flag.ExitOnError)
-	provider := fs.String("provider", "", "provider filter")
-	_ = fs.Parse(args)
-	r := repo.New(dbPath)
-	rows, err := r.ListAccounts()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "export failed:", err)
-		os.Exit(1)
-	}
-	ids := make([]string, 0, len(rows))
-	for _, a := range rows {
-		if *provider == "" || strings.EqualFold(a.Provider, *provider) {
-			ids = append(ids, a.ID)
-		}
-	}
-	if len(ids) == 0 {
-		fmt.Fprintln(os.Stderr, "export failed: no accounts matched")
-		os.Exit(1)
-	}
-	path, err := r.ExportAccounts(ids)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "export failed:", err)
-		os.Exit(1)
-	}
-	fmt.Println("exported", path)
 }
 
 func setupRuntime() (map[string]string, string, error) {
@@ -240,12 +205,14 @@ func checkDB(path string) error {
 		return err
 	}
 	defer db.Close()
-	var status string
-	if err := db.QueryRow(`PRAGMA quick_check`).Scan(&status); err != nil {
-		return err
-	}
-	if strings.ToLower(strings.TrimSpace(status)) != "ok" {
-		return fmt.Errorf("sqlite quick_check failed: %s", status)
+	for _, q := range []string{
+		`SELECT COUNT(*) FROM providerConnections`,
+		`SELECT COUNT(*) FROM providerNodes`,
+	} {
+		var n int
+		if err := db.QueryRow(q).Scan(&n); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -255,7 +222,7 @@ func runTUI(db string) {
 		fmt.Fprintf(os.Stderr, "DB not found: %s\nSet db_path in %s\n", db, filepath.Join(appDir, "9rtui.ini"))
 		os.Exit(1)
 	}
-	p := tea.NewProgram(tui.New(db), tea.WithAltScreen())
+	p := tea.NewProgram(tui.New(db, version, commit, buildDate), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -274,8 +241,8 @@ func handleWeb(args []string, port int, db string) {
 		runWebForeground("0.0.0.0", port, db)
 	case "serve":
 		host := "127.0.0.1"
-		if len(args) > 1 {
-			host = args[1]
+		if len(args) > 1 && args[1] == "expose" {
+			host = "0.0.0.0"
 		}
 		runWebServer(host, port, db)
 	case "stop":
@@ -299,13 +266,12 @@ func runWebForeground(host string, port int, db string) {
 		fmt.Fprintln(os.Stderr, "password setup failed:", err)
 		os.Exit(1)
 	}
-	urlHost := host
-	if host == "0.0.0.0" {
-		urlHost = "localhost"
-	}
+	urlHost := displayHost(host)
 	fmt.Printf("\n9rtui web running at http://%s:%d\n", urlHost, port)
-	fmt.Println("1) Send to background")
-	fmt.Println("2) Exit / Ctrl+C / Ctrl+D")
+	fmt.Println("\nChoose:")
+	fmt.Println("  1) Keep running in background")
+	fmt.Println("  2) Stop and exit")
+	fmt.Println("\nClose this window or press Ctrl+C to stop foreground server.")
 	fmt.Println()
 	go func() {
 		if err := s.Serve(); err != nil && err != http.ErrServerClosed {
@@ -347,6 +313,8 @@ func runWebServer(host string, port int, db string) {
 	}
 	_ = web.WritePID(appDir, port)
 	defer web.RemovePID(appDir)
+	urlHost := displayHost(host)
+	fmt.Printf("9rtui web running at http://%s:%d\n", urlHost, port)
 	if err := s.Serve(); err != nil && err != http.ErrServerClosed {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -361,11 +329,59 @@ func sendWebBackground(host string, port int) error {
 	if real, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = real
 	}
-	cmd := exec.Command(exe, "--port", strconv.Itoa(port), "web", "serve", host)
+	mode := "start"
+	if host == "0.0.0.0" {
+		mode = "expose"
+	}
+	cmd := exec.Command(exe, "--port", strconv.Itoa(port), "web", "serve", mode)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.Stdin = nil
+	detachCommand(cmd)
 	return cmd.Start()
+}
+
+func displayHost(host string) string {
+	if host != "0.0.0.0" {
+		return host
+	}
+	if ip := localLANIP(); ip != "" {
+		return ip
+	}
+	return "0.0.0.0"
+}
+
+func localLANIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err == nil {
+		defer conn.Close()
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil && !addr.IP.IsLoopback() {
+			return addr.IP.String()
+		}
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip4 := ip.To4(); ip4 != nil && !ip4.IsLoopback() {
+				return ip4.String()
+			}
+		}
+	}
+	return ""
 }
 
 func promptPassword() (string, error) {

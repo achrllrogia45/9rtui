@@ -37,6 +37,8 @@ const (
 	confirmVacuum
 	confirmRestore
 	exportDone
+	updatePage
+	confirmUpdate
 )
 
 type importProviderOption struct {
@@ -130,6 +132,45 @@ type Model struct {
 	// pickerFocus 0 = left file list, 1 = right-top accounts preview
 	pickerFocus     int
 	pickerAccCursor int
+	version         string
+	commit          string
+	buildDate       string
+	updateAvailable bool
+	updateCursor    int
+	updateReleases  []updateRelease
+	updateRunning   bool
+	updateDone      int64
+	updateTotal     int64
+	updateStatus    string
+	updateErr       string
+}
+
+type updateRelease struct {
+	Tag     string
+	Kind    string
+	State   string
+	URL     string
+	Asset   string
+	Summary string
+}
+
+type updateProgressMsg struct{}
+
+type updateDoneMsg struct {
+	path    string
+	restart bool
+	err     error
+}
+
+var updateProg struct {
+	sync.Mutex
+	running bool
+	done    int64
+	total   int64
+}
+
+func updateTick() tea.Cmd {
+	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return updateProgressMsg{} })
 }
 
 type importDoneMsg struct {
@@ -162,8 +203,8 @@ func importTick() tea.Cmd {
 	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return importProgressMsg{} })
 }
 
-func New(dbPath string) Model {
-	m := Model{r: repo.New(dbPath), selected: map[string]bool{}, importSelected: map[string]bool{}, focusLeft: true, stateFilter: "off", sortField: "name", importFilter: "all", importSort: "email", importProvider: "kiro"}
+func New(dbPath, version, commit, buildDate string) Model {
+	m := Model{r: repo.New(dbPath), selected: map[string]bool{}, importSelected: map[string]bool{}, focusLeft: true, stateFilter: "off", sortField: "name", importFilter: "all", importSort: "email", importProvider: "kiro", version: version, commit: commit, buildDate: buildDate}
 	m.refresh()
 	return m
 }
@@ -219,6 +260,32 @@ func (m Model) visible() []domain.Account {
 }
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch x := msg.(type) {
+	case updateProgressMsg:
+		updateProg.Lock()
+		m.updateRunning = updateProg.running
+		m.updateDone = updateProg.done
+		m.updateTotal = updateProg.total
+		running := updateProg.running
+		updateProg.Unlock()
+		if running {
+			return m, updateTick()
+		}
+		return m, nil
+	case updateDoneMsg:
+		m.updateRunning = false
+		updateProg.Lock()
+		updateProg.running = false
+		updateProg.Unlock()
+		if x.err != nil {
+			m.updateErr = x.err.Error()
+			m.updateStatus = "update failed"
+			return m, nil
+		}
+		m.updateStatus = "updated: " + x.path
+		if x.restart {
+			return m, tea.Quit
+		}
+		return m, nil
 	case vacuumDoneMsg:
 		m.vacuumRunning = false
 		if x.err != nil {
@@ -310,6 +377,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		switch m.mode {
+		case updatePage:
+			switch k {
+			case "esc", "q":
+				m.mode = normal
+			case "j", "down":
+				if m.updateCursor < len(m.updateReleases)-1 {
+					m.updateCursor++
+				}
+			case "k", "up":
+				if m.updateCursor > 0 {
+					m.updateCursor--
+				}
+			case "enter", "U", "u":
+				if len(m.updateReleases) > 0 && !m.updateRunning {
+					m.mode = confirmUpdate
+				}
+			}
+			return m, nil
+		case confirmUpdate:
+			if k == "esc" || k == "n" || k == "N" {
+				m.mode = updatePage
+				return m, nil
+			}
+			if (k == "enter" || k == "y" || k == "Y") && !m.updateRunning {
+				m.mode = updatePage
+				m.updateRunning = true
+				m.updateStatus = "downloading..."
+				m.updateErr = ""
+				return m, tea.Batch(m.downloadUpdateCmd(), updateTick())
+			}
+			return m, nil
 		case exportDone:
 			if k == "enter" || k == "esc" || k == "o" || k == "O" {
 				m.clearOverlay()
@@ -550,6 +648,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		switch k {
+		case "U", "u":
+			if len(m.updateReleases) == 0 {
+				m.updateReleases = m.defaultUpdateReleases()
+			}
+			m.mode = updatePage
+			return m, nil
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "?":
@@ -578,21 +682,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refresh()
 		case "I":
 			return m.openImportProvider()
-		case "b":
+		case "b", "B":
 			ui, err := m.r.UndoLogs()
 			if err != nil {
 				m.msg = err.Error()
+				m.undoInfos = nil
 			} else {
 				m.undoInfos = ui
-				m.undoCursor = 0
-				m.backupScroll = 0
-				m.mode = backups
-				m.restorePreviewPath = ""
-				m.restorePreviewText = ""
-				m.restorePreviewScroll = 0
-				if len(ui) > 0 {
-					return m, m.loadRestorePreviewCmd()
+				if len(ui) == 0 {
+					m.msg = "no restore logs found; delete writes undo logs here"
 				}
+			}
+			m.undoCursor = 0
+			m.backupScroll = 0
+			m.mode = backups
+			m.restorePreviewPath = ""
+			m.restorePreviewText = ""
+			m.restorePreviewScroll = 0
+			if len(m.undoInfos) > 0 {
+				return m, m.loadRestorePreviewCmd()
 			}
 		case "d":
 			if len(m.ids()) > 0 {
@@ -975,6 +1083,12 @@ func (m Model) View() string {
 		bg := lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, m.inspectView())
 		popup := m.overlayView()
 		body = overlayPopup(m.w, m.h, bg, popup)
+	case updatePage:
+		body = m.updateView()
+	case confirmUpdate:
+		bg := lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, m.updateView())
+		popup := m.confirmUpdateView()
+		body = overlayPopup(m.w, m.h, bg, popup)
 	case importProvider:
 		body = m.importProviderView()
 	case importFilePicker:
@@ -1126,21 +1240,138 @@ func (m Model) headerView(visible int) string {
 		filterStyle.Render(" filter: "+m.stateFilter+" "),
 		sortStyle.Render(" sort: "+m.sortField+" "+m.sortDirLabel()+" "),
 	)
-	releaseURL := strings.TrimSpace(os.Getenv("NRTUI_RELEASE_URL"))
-	if releaseURL == "" {
-		releaseURL = "https://github.com/achrllrogia45/9rtui/releases/latest"
-	}
-	update := muted.Render("  updates: " + releaseURL)
 	status := muted.Render("  " + m.msg)
 	if bin := strings.TrimSpace(os.Getenv("NRTUI_BINARY_PATH")); bin != "" {
 		status = lipgloss.JoinVertical(lipgloss.Left, status, muted.Render("  binary: "+bin))
 	}
-	return topbar.Width(max(0, m.w-2)).Render(lipgloss.JoinVertical(lipgloss.Left, update, bar, status))
+	if m.updateAvailable {
+		update := errChip.Render(" UPDATE AVAILABLE — PRESS U ")
+		return topbar.Width(max(0, m.w-2)).Render(lipgloss.JoinVertical(lipgloss.Left, update, bar, status))
+	}
+	return topbar.Width(max(0, m.w-2)).Render(lipgloss.JoinVertical(lipgloss.Left, bar, status))
 }
 
 func (m Model) footerView() string {
-	keys := " h/l pane  j/k move  gg/G jump  Enter/i inspect  I import  Space select  v visual  O on/off  f filter  s/S sort  d delete  b recovery  r refresh  ? help  q quit "
-	return footer.Width(max(0, m.w-2)).Render(keys)
+	keys := " h/l pane  j/k move  gg/G jump  Enter/i inspect  I import  Space select  v visual  O on/off  f filter  s/S sort  d delete  b recovery  U updates  r refresh  ? help  q quit "
+	v := m.version
+	if v == "" || v == "dev" {
+		v = "v0.1-dev"
+	}
+	badgeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Padding(0, 1)
+	if m.updateAvailable {
+		badgeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#F59E0B")).Padding(0, 2)
+	}
+	badge := badgeStyle.Render(v)
+	hint := ""
+	if m.updateAvailable {
+		hint = muted.Render("  PRESS U TO UPDATE")
+	}
+	left := lipgloss.JoinHorizontal(lipgloss.Center, badge, hint)
+	line := left + "  " + keys
+	return footer.Width(max(0, m.w-2)).Render(clipLine(line, max(0, m.w-2)))
+}
+
+func (m Model) defaultUpdateReleases() []updateRelease {
+	asset := updateAssetName()
+	url := "https://github.com/achrllrogia45/9rtui/releases/download/v0.1beta/" + asset
+	return []updateRelease{
+		{Tag: "v0.2.0-beta.1", Kind: "beta", State: "newer", URL: url, Asset: asset, Summary: "available update preview"},
+		{Tag: firstNonEmptyString(m.version, "v0.1beta"), Kind: "beta", State: "current", URL: url, Asset: asset, Summary: "current installed release"},
+		{Tag: "v0.0.9-alpha", Kind: "alpha", State: "older", URL: url, Asset: asset, Summary: "older test release"},
+	}
+}
+
+func updateAssetName() string {
+	if runtime.GOOS == "windows" {
+		return "9rtui-windows-" + runtime.GOARCH + ".exe"
+	}
+	return "9rtui-" + runtime.GOOS + "-" + runtime.GOARCH
+}
+
+func firstNonEmptyString(xs ...string) string {
+	for _, x := range xs {
+		if strings.TrimSpace(x) != "" {
+			return x
+		}
+	}
+	return ""
+}
+
+func (m Model) updateView() string {
+	if len(m.updateReleases) == 0 {
+		m.updateReleases = m.defaultUpdateReleases()
+	}
+	w := max(72, m.w-2)
+	bodyH := max(10, m.h-8)
+	var b strings.Builder
+	b.WriteString(brand.Render(" Update Center ") + "\n")
+	b.WriteString(muted.Render(" current: "+firstNonEmptyString(m.version, "dev")+"  commit: "+firstNonEmptyString(m.commit, "unknown")+"  built: "+firstNonEmptyString(m.buildDate, "unknown")) + "\n")
+	if bin := strings.TrimSpace(os.Getenv("NRTUI_BINARY_PATH")); bin != "" {
+		b.WriteString(muted.Render(" binary: "+bin) + "\n")
+	}
+	b.WriteString("\n")
+	for i, r := range m.updateReleases {
+		cursor := "  "
+		if i == m.updateCursor {
+			cursor = "▶ "
+		}
+		line := fmt.Sprintf("%s%s  %s  %s", cursor, r.Tag, r.Kind, r.Summary)
+		switch r.State {
+		case "newer":
+			b.WriteString(clipLine(line, w-4) + "\n")
+		case "current":
+			b.WriteString(muted.Render(clipLine(line+"  (current)", w-4)) + "\n")
+		default:
+			b.WriteString(empty.Render(clipLine(line, w-4)) + "\n")
+		}
+	}
+	for i := len(m.updateReleases); i < bodyH; i++ {
+		b.WriteString("\n")
+	}
+	if m.updateRunning {
+		b.WriteString(ok.Render(" downloading ") + " " + updateProgressLabel(m.updateDone, m.updateTotal) + "\n")
+	} else if m.updateErr != "" {
+		b.WriteString(errChip.Render(" ERROR ") + " " + m.updateErr + "\n")
+	} else if m.updateStatus != "" {
+		b.WriteString(ok.Render(" "+m.updateStatus+" ") + "\n")
+	}
+	b.WriteString(muted.Render(" j/k or arrows select   Enter confirm   U confirm   Esc/q back "))
+	return box.Width(w).Render(b.String())
+}
+
+func updateProgressLabel(done, total int64) string {
+	if total > 0 {
+		return fmt.Sprintf("%d/%d %.1f%%", done, total, float64(done)*100/float64(total))
+	}
+	return fmt.Sprintf("%d bytes", done)
+}
+
+func (m Model) confirmUpdateView() string {
+	r := m.updateReleases[m.updateCursor]
+	body := fmt.Sprintf("Install selected release?\n\nCurrent: %s\nSelected: %s\nAsset: %s\n\nThis downloads a new binary. Linux will chmod +x and restart. Windows will create an updater script, exit 9rtui, replace the exe, then relaunch.\n\nEnter/y confirm   Esc/n cancel", firstNonEmptyString(m.version, "dev"), r.Tag, r.Asset)
+	return box.Width(clamp(m.w-8, 58, 96)).Render(brand.Render(" Update ") + "\n" + body)
+}
+
+func (m Model) downloadUpdateCmd() tea.Cmd {
+	r := m.updateReleases[m.updateCursor]
+	return func() tea.Msg {
+		// Experimental UI only. Do not mutate/replace binaries until updater is proven.
+		updateProg.Lock()
+		updateProg.running = true
+		updateProg.done = 0
+		updateProg.total = 100
+		updateProg.Unlock()
+		for i := int64(0); i <= 100; i += 20 {
+			time.Sleep(120 * time.Millisecond)
+			updateProg.Lock()
+			updateProg.done = i
+			updateProg.Unlock()
+		}
+		updateProg.Lock()
+		updateProg.running = false
+		updateProg.Unlock()
+		return updateDoneMsg{path: "simulated update: " + r.Tag, restart: false}
+	}
 }
 
 func (m Model) importCmd(label string, ids []string, limit int, doImport bool) tea.Cmd {
