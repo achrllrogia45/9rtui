@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/9rtui/9rtui/internal/domain"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 type Repo struct {
@@ -23,7 +23,7 @@ type Repo struct {
 
 func New(path string) *Repo { return &Repo{Path: path, logDir: defaultLogDir()} }
 func (r *Repo) open() (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", sqliteFileDSN(r.Path, "_busy_timeout=10000&_journal_mode=WAL&_foreign_keys=on"))
+	db, err := sql.Open("sqlite", sqliteFileDSN(r.Path, "_busy_timeout=10000&_journal_mode=WAL&_foreign_keys=on"))
 	if err != nil {
 		return nil, err
 	}
@@ -736,7 +736,7 @@ func sqliteBackup(src, dst string) error {
 	}
 	tmp := dst + ".tmp"
 	_ = os.Remove(tmp)
-	db, err := sql.Open("sqlite3", sqliteFileDSN(src, "_busy_timeout=10000&mode=ro"))
+	db, err := sql.Open("sqlite", sqliteFileDSN(src, "_busy_timeout=10000&mode=ro"))
 	if err != nil {
 		return err
 	}
@@ -754,7 +754,7 @@ func sqliteBackup(src, dst string) error {
 }
 
 func verifySQLite(path string) error {
-	db, err := sql.Open("sqlite3", sqliteFileDSN(path, "mode=ro"))
+	db, err := sql.Open("sqlite", sqliteFileDSN(path, "mode=ro"))
 	if err != nil {
 		return err
 	}

@@ -4,16 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHARE="${NRTUI_PC_SHARE:-/home/hilman/pc-share/9rtui}"
 OWNER="${NRTUI_OWNER:-hilman:hilman}"
-WIN_CC="${NRTUI_WIN_CC:-x86_64-w64-mingw32-gcc}"
-
 cd "$ROOT"
 
 if ! command -v go >/dev/null 2>&1; then
   echo "ERROR: go not found" >&2
-  exit 1
-fi
-if ! command -v "$WIN_CC" >/dev/null 2>&1; then
-  echo "ERROR: $WIN_CC not found; install mingw-w64" >&2
   exit 1
 fi
 
@@ -23,8 +17,8 @@ go test ./...
 echo "==> build linux: $ROOT/9rtui"
 go build -o "$ROOT/9rtui" .
 
-echo "==> build windows CGO sqlite: $ROOT/9rtui.exe"
-CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC="$WIN_CC" go build -o "$ROOT/9rtui.exe" .
+echo "==> build windows: $ROOT/9rtui.exe"
+GOOS=windows GOARCH=amd64 go build -o "$ROOT/9rtui.exe" .
 
 echo "==> copy windows exe to share: $SHARE/9rtui.exe"
 mkdir -p "$SHARE" 2>/dev/null || sudo mkdir -p "$SHARE"

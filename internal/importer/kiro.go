@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 const DefaultAPI = "http://192.168.0.44:20128"
@@ -392,7 +392,7 @@ func FetchExistingFromDB(path string) (existingKeys, error) {
 	if strings.TrimSpace(path) == "" {
 		path = default9RouterDBPath()
 	}
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return ex, err
 	}
@@ -854,7 +854,7 @@ func upsertOAuthAccount(dbPath, provider string, row KiroAccount, now time.Time)
 	if err := ensureDevDBPath(dbPath); err != nil {
 		return ImportResult{Email: row.Email, SourceID: row.ID, Error: err.Error()}
 	}
-	db, err := sql.Open("sqlite3", sqliteFileDSN(dbPath, "_busy_timeout=10000&_journal_mode=WAL&_foreign_keys=on"))
+	db, err := sql.Open("sqlite", sqliteFileDSN(dbPath, "_busy_timeout=10000&_journal_mode=WAL&_foreign_keys=on"))
 	if err != nil {
 		return ImportResult{Email: row.Email, SourceID: row.ID, Error: err.Error()}
 	}
@@ -894,7 +894,7 @@ func quickCheckPath(dbPath string) (string, error) {
 	if err := ensureDevDBPath(dbPath); err != nil {
 		return "", err
 	}
-	db, err := sql.Open("sqlite3", sqliteFileDSN(dbPath, "_busy_timeout=10000&_journal_mode=WAL&_foreign_keys=on"))
+	db, err := sql.Open("sqlite", sqliteFileDSN(dbPath, "_busy_timeout=10000&_journal_mode=WAL&_foreign_keys=on"))
 	if err != nil {
 		return "", err
 	}

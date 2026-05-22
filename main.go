@@ -16,10 +16,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/9rtui/9rtui/internal/importer"
+	"github.com/9rtui/9rtui/internal/repo"
 	"github.com/9rtui/9rtui/internal/tui"
 	"github.com/9rtui/9rtui/internal/web"
 	tea "github.com/charmbracelet/bubbletea"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 var appDir = detectAppDir()
@@ -51,6 +53,12 @@ func main() {
 
 	if len(args) > 0 {
 		switch args[0] {
+		case "version":
+			fmt.Printf("9rtui %s (commit %s, built %s)\n", version, commit, buildDate)
+			return
+		case "config":
+			printConfig(cfg, db)
+			return
 		case "web":
 			handleWeb(args[1:], *port, db)
 			return
@@ -71,6 +79,12 @@ func main() {
 			}
 			fmt.Println("DB OK:", db)
 			return
+		case "import-file":
+			handleImportFile(args[1:], db)
+			return
+		case "export":
+			handleExport(args[1:], db)
+			return
 		case "restart":
 			_ = web.StopHard(appDir)
 			handleWeb([]string{"start"}, *port, db)
@@ -87,11 +101,15 @@ func usage() {
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Usage:")
 	fmt.Fprintln(out, "  9rtui                         open TUI")
+	fmt.Fprintln(out, "  9rtui version                 print version and exit")
+	fmt.Fprintln(out, "  9rtui config                  print resolved config")
 	fmt.Fprintln(out, "  9rtui tui                     open TUI")
 	fmt.Fprintln(out, "  9rtui web start               run web TUI at localhost:20129")
 	fmt.Fprintln(out, "  9rtui web expose              run web TUI at 0.0.0.0:20129")
 	fmt.Fprintln(out, "  9rtui stop                    hard-stop all running 9rtui web servers")
 	fmt.Fprintln(out, "  9rtui check-db                verify configured 9Router DB")
+	fmt.Fprintln(out, "  9rtui import-file -provider kiro -file accounts.json")
+	fmt.Fprintln(out, "  9rtui export [-provider kiro] export account JSON to .accounts")
 	fmt.Fprintln(out, "  9rtui web stop                alias for stop")
 	fmt.Fprintln(out, "  9rtui web restart             restart web server")
 	fmt.Fprintln(out, "  9rtui restart                 restart web server")
@@ -100,11 +118,70 @@ func usage() {
 	flag.PrintDefaults()
 }
 
+func printConfig(cfg map[string]string, db string) {
+	fmt.Println("project_dir:", appDir)
+	fmt.Println("db_path:", db)
+	fmt.Println("log_dir:", resolveAppPath(expandConfigPath(cfg["log_dir"])))
+	fmt.Println("accounts_path:", resolveAppPath(expandConfigPath(cfg["accounts_path"])))
+	fmt.Println("api_base:", cfg["api_base"])
+	fmt.Println("dev_mode:", cfg["dev_mode"])
+	fmt.Println("version:", version)
+	fmt.Println("commit:", commit)
+	fmt.Println("built:", buildDate)
+}
+
+func handleImportFile(args []string, dbPath string) {
+	fs := flag.NewFlagSet("import-file", flag.ExitOnError)
+	provider := fs.String("provider", "kiro", "provider name")
+	file := fs.String("file", "", "account JSON file")
+	dryRun := fs.Bool("dry-run", false, "preview without writing")
+	limit := fs.Int("limit", 0, "max rows to import")
+	_ = fs.Parse(args)
+	if strings.TrimSpace(*file) == "" {
+		fmt.Fprintln(os.Stderr, "import-file requires -file")
+		os.Exit(2)
+	}
+	res, err := importer.RunProvider(context.Background(), importer.ImportOptions{AccountsPath: *file, DBPath: dbPath, DoImport: !*dryRun, DryRun: *dryRun, IncludeInactive: true, Limit: *limit}, *provider)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "import failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("selected=%d ok=%d fail=%d skipped=%d db=%s log=%s\n", res.Selected, res.OK, res.Fail, res.Skipped, res.DBCheck, res.LogPath)
+}
+
+func handleExport(args []string, dbPath string) {
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	provider := fs.String("provider", "", "provider filter")
+	_ = fs.Parse(args)
+	r := repo.New(dbPath)
+	rows, err := r.ListAccounts()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "export failed:", err)
+		os.Exit(1)
+	}
+	ids := make([]string, 0, len(rows))
+	for _, a := range rows {
+		if *provider == "" || strings.EqualFold(a.Provider, *provider) {
+			ids = append(ids, a.ID)
+		}
+	}
+	if len(ids) == 0 {
+		fmt.Fprintln(os.Stderr, "export failed: no accounts matched")
+		os.Exit(1)
+	}
+	path, err := r.ExportAccounts(ids)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "export failed:", err)
+		os.Exit(1)
+	}
+	fmt.Println("exported", path)
+}
+
 func setupRuntime() (map[string]string, string, error) {
 	cfgPath := filepath.Join(appDir, "9rtui.ini")
 	cfg := loadINI(cfgPath)
 
-	dbEnv := strings.TrimSpace(os.Getenv("NINETUI_DB"))
+	dbEnv := strings.TrimSpace(os.Getenv("NRTUI_DB"))
 	db := resolveAppPath(expandConfigPath(firstNonEmpty(dbEnv, cfg["db_path"])))
 	if db == "" || (dbEnv == "" && !ok9RouterDB(db)) {
 		db = detectDB()
@@ -114,13 +191,13 @@ func setupRuntime() (map[string]string, string, error) {
 		fmt.Fprintf(os.Stderr, "9Router DB not found. Set db_path in %s\n", cfgPath)
 	}
 
-	logDir := firstNonEmpty(os.Getenv("NINETUI_LOG_DIR"), cfg["log_dir"])
+	logDir := firstNonEmpty(os.Getenv("NRTUI_LOG_DIR"), cfg["log_dir"])
 	if logDir == "" {
 		logDir = filepath.Join(appDir, ".tui-logs")
 	} else {
 		logDir = resolveAppPath(expandConfigPath(logDir))
 	}
-	apiBase := firstNonEmpty(os.Getenv("NINETUI_API"), cfg["api_base"])
+	apiBase := firstNonEmpty(os.Getenv("NRTUI_API"), cfg["api_base"])
 	if apiBase == "" {
 		apiBase = "http://localhost:20128"
 	}
@@ -140,11 +217,11 @@ func setupRuntime() (map[string]string, string, error) {
 	_ = saveINI(cfgPath, cfg)
 
 	_ = os.MkdirAll(logDir, 0755)
-	_ = os.Setenv("NINETUI_LOG_DIR", logDir)
-	_ = os.Setenv("NINETUI_API", apiBase)
-	_ = os.Setenv("NINETUI_DEV_MODE", cfg["dev_mode"])
-	if strings.TrimSpace(os.Getenv("NINETUI_ACCOUNTS_PATH")) == "" {
-		_ = os.Setenv("NINETUI_ACCOUNTS_PATH", accountsPath+string(os.PathSeparator))
+	_ = os.Setenv("NRTUI_LOG_DIR", logDir)
+	_ = os.Setenv("NRTUI_API", apiBase)
+	_ = os.Setenv("NRTUI_DEV_MODE", cfg["dev_mode"])
+	if strings.TrimSpace(os.Getenv("NRTUI_ACCOUNTS_PATH")) == "" {
+		_ = os.Setenv("NRTUI_ACCOUNTS_PATH", accountsPath+string(os.PathSeparator))
 	}
 	return cfg, db, nil
 }
@@ -154,7 +231,7 @@ func checkDB(path string) error {
 	if _, err := os.Stat(path); err != nil {
 		return err
 	}
-	db, err := sql.Open("sqlite3", sqliteFileDSN(path, "mode=ro&_busy_timeout=10000"))
+	db, err := sql.Open("sqlite", sqliteFileDSN(path, "mode=ro&_busy_timeout=10000"))
 	if err != nil {
 		return err
 	}
