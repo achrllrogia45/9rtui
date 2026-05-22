@@ -34,15 +34,19 @@ function Sync-Scripts {
         Say "download scripts/source: $Url"
         Invoke-WebRequest -Uri $Url -OutFile $Zip
     }
+    $ExtractDir = Join-Path $CacheDir "extract"
     if (Test-Path $SrcDir) { Remove-Item -Recurse -Force $SrcDir }
-    New-Item -ItemType Directory -Force -Path $SrcDir | Out-Null
-    Expand-Archive -Force -Path $Zip -DestinationPath $CacheDir
-    $Expanded = Get-ChildItem $CacheDir -Directory | Where-Object { $_.Name -like "9rtui-*" -and $_.FullName -ne $SrcDir } | Select-Object -First 1
+    if (Test-Path $ExtractDir) { Remove-Item -Recurse -Force $ExtractDir }
+    New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
+    Expand-Archive -Force -Path $Zip -DestinationPath $ExtractDir
+    $Expanded = Get-ChildItem $ExtractDir -Directory | Select-Object -First 1
     if (!$Expanded) { Fail "failed to locate extracted source" }
     Move-Item -Force $Expanded.FullName $SrcDir
+    $ScriptSource = Join-Path $SrcDir "scripts"
+    if (!(Test-Path $ScriptSource)) { Fail "release source archive missing scripts directory: $ScriptSource" }
     $Scripts = Join-Path $InstallDir "scripts"
     if (Test-Path $Scripts) { Remove-Item -Recurse -Force $Scripts }
-    Copy-Item -Recurse (Join-Path $SrcDir "scripts") $Scripts
+    Copy-Item -Recurse $ScriptSource $Scripts
 }
 
 function Build-FromSource {

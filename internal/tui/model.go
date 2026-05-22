@@ -1126,8 +1126,16 @@ func (m Model) headerView(visible int) string {
 		filterStyle.Render(" filter: "+m.stateFilter+" "),
 		sortStyle.Render(" sort: "+m.sortField+" "+m.sortDirLabel()+" "),
 	)
+	releaseURL := strings.TrimSpace(os.Getenv("NRTUI_RELEASE_URL"))
+	if releaseURL == "" {
+		releaseURL = "https://github.com/achrllrogia45/9rtui/releases/latest"
+	}
+	update := muted.Render("  updates: " + releaseURL)
 	status := muted.Render("  " + m.msg)
-	return topbar.Width(max(0, m.w-2)).Render(lipgloss.JoinVertical(lipgloss.Left, bar, status))
+	if bin := strings.TrimSpace(os.Getenv("NRTUI_BINARY_PATH")); bin != "" {
+		status = lipgloss.JoinVertical(lipgloss.Left, status, muted.Render("  binary: "+bin))
+	}
+	return topbar.Width(max(0, m.w-2)).Render(lipgloss.JoinVertical(lipgloss.Left, update, bar, status))
 }
 
 func (m Model) footerView() string {
@@ -2260,7 +2268,7 @@ func overlayPopup(w, h int, bg, popup string) string {
 }
 
 func (m Model) openImportFilePicker() (tea.Model, tea.Cmd) {
-	accountsPath := strings.TrimSpace(os.Getenv("NINETUI_ACCOUNTS_PATH"))
+	accountsPath := strings.TrimSpace(os.Getenv("NRTUI_ACCOUNTS_PATH"))
 	if accountsPath == "" {
 		accountsPath = filepath.Join(filepath.Dir(os.Args[0]), ".accounts") + string(os.PathSeparator)
 	}
@@ -2392,7 +2400,7 @@ func (m Model) updateImportFilePicker(k string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		selectedFile := m.importFiles[m.importFileCursor]
-		accountsPath := strings.TrimSpace(os.Getenv("NINETUI_ACCOUNTS_PATH"))
+		accountsPath := strings.TrimSpace(os.Getenv("NRTUI_ACCOUNTS_PATH"))
 		if accountsPath == "" {
 			accountsPath = filepath.Join(filepath.Dir(os.Args[0]), ".accounts") + string(os.PathSeparator)
 		}
@@ -2403,7 +2411,7 @@ func (m Model) updateImportFilePicker(k string) (tea.Model, tea.Cmd) {
 
 	// trigger preview reload if cursor changed or first view
 	if len(m.importFiles) > 0 {
-		accountsPath := strings.TrimSpace(os.Getenv("NINETUI_ACCOUNTS_PATH"))
+		accountsPath := strings.TrimSpace(os.Getenv("NRTUI_ACCOUNTS_PATH"))
 		if accountsPath == "" {
 			accountsPath = filepath.Join(filepath.Dir(os.Args[0]), ".accounts") + string(os.PathSeparator)
 		}

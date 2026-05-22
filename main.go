@@ -220,6 +220,10 @@ func setupRuntime() (map[string]string, string, error) {
 	_ = os.Setenv("NRTUI_LOG_DIR", logDir)
 	_ = os.Setenv("NRTUI_API", apiBase)
 	_ = os.Setenv("NRTUI_DEV_MODE", cfg["dev_mode"])
+	if exe, err := os.Executable(); err == nil {
+		_ = os.Setenv("NRTUI_BINARY_PATH", exe)
+	}
+	_ = os.Setenv("NRTUI_RELEASE_URL", "https://github.com/achrllrogia45/9rtui/releases/latest")
 	if strings.TrimSpace(os.Getenv("NRTUI_ACCOUNTS_PATH")) == "" {
 		_ = os.Setenv("NRTUI_ACCOUNTS_PATH", accountsPath+string(os.PathSeparator))
 	}
