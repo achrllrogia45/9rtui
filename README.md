@@ -18,7 +18,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/achrllrogia45/9rtui/main/install.ps1 | iex
 ```
 
-Installers build from source on your machine and install into:
+Installers download prebuilt single binaries by default and install into:
 
 - Linux/macOS: `~/.9rtui`
 - Windows: `%USERPROFILE%\.9rtui`
@@ -99,6 +99,16 @@ Local helper:
 
 ```bash
 scripts/build-all.sh
+```
+
+Force source-build install instead of prebuilt release binary:
+
+```bash
+NRTUI_BUILD_FROM_SOURCE=1 curl -fsSL https://raw.githubusercontent.com/achrllrogia45/9rtui/main/install.sh | bash
+```
+
+```powershell
+$env:NRTUI_BUILD_FROM_SOURCE="1"; irm https://raw.githubusercontent.com/achrllrogia45/9rtui/main/install.ps1 | iex
 ```
 
 ## Security
