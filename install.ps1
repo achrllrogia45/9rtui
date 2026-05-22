@@ -13,12 +13,53 @@ function Say($Message) { Write-Host $Message }
 function Fail($Message) { throw $Message }
 function Need($Name) { if (!(Get-Command $Name -ErrorAction SilentlyContinue)) { Fail "missing dependency: $Name" } }
 
-Need go
-
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir ".accounts") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir ".tui-logs\full-backups") | Out-Null
 New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+
+function Ensure-Go {
+    if (Get-Command go -ErrorAction SilentlyContinue) { return }
+
+    $LocalGo = Join-Path $InstallDir "cache\go"
+    $LocalGoBin = Join-Path $LocalGo "bin"
+    $LocalGoExe = Join-Path $LocalGoBin "go.exe"
+    if (Test-Path $LocalGoExe) {
+        $env:PATH = "$LocalGoBin;$env:PATH"
+        return
+    }
+
+    $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    switch ($Arch) {
+        "x64" { $GoArch = "amd64" }
+        "arm64" { $GoArch = "arm64" }
+        default { Fail "unsupported architecture for local Go install: $Arch" }
+    }
+
+    Say "go not found; installing local Go into $LocalGo"
+    $Feed = Invoke-RestMethod -Uri "https://go.dev/dl/?mode=json"
+    $File = $Feed[0].files | Where-Object { $_.os -eq "windows" -and $_.arch -eq $GoArch -and $_.filename -like "*.zip" } | Select-Object -First 1
+    if (!$File) { Fail "could not find Go windows/$GoArch zip" }
+
+    $GoZip = Join-Path $CacheDir $File.filename
+    if (!(Test-Path $GoZip) -or $env:NRTUI_REFRESH -eq "1") {
+        Say "download: https://go.dev/dl/$($File.filename)"
+        Invoke-WebRequest -Uri "https://go.dev/dl/$($File.filename)" -OutFile $GoZip
+    } else {
+        Say "using cached Go archive: $GoZip"
+    }
+
+    $GoExtract = Join-Path $CacheDir "go-extract"
+    if (Test-Path $GoExtract) { Remove-Item -Recurse -Force $GoExtract }
+    New-Item -ItemType Directory -Force -Path $GoExtract | Out-Null
+    Expand-Archive -Force -Path $GoZip -DestinationPath $GoExtract
+    if (Test-Path $LocalGo) { Remove-Item -Recurse -Force $LocalGo }
+    New-Item -ItemType Directory -Force -Path (Split-Path $LocalGo) | Out-Null
+    Move-Item -Force (Join-Path $GoExtract "go") $LocalGo
+    $env:PATH = "$LocalGoBin;$env:PATH"
+}
+
+Ensure-Go
 
 $Zip = Join-Path $CacheDir "9rtui-$Branch.zip"
 $Url = "https://github.com/$Repo/archive/refs/heads/$Branch.zip"

@@ -18,7 +18,6 @@ if [ "${EUID:-$(id -u)}" = "0" ] && [ -z "${NRTUI_ALLOW_SUDO:-}" ]; then
   fail "do not run installer with sudo; set NRTUI_ALLOW_SUDO=1 only if intentional"
 fi
 
-need go
 need curl
 need tar
 need mkdir
@@ -27,6 +26,44 @@ need cp
 need chmod
 
 mkdir -p "$INSTALL_DIR/.accounts" "$INSTALL_DIR/.tui-logs/full-backups" "$CACHE_DIR" "$BIN_DIR"
+
+ensure_go() {
+  if command -v go >/dev/null 2>&1; then
+    return
+  fi
+  local_go="$INSTALL_DIR/cache/go"
+  if [ -x "$local_go/bin/go" ]; then
+    export PATH="$local_go/bin:$PATH"
+    return
+  fi
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) fail "unsupported architecture for local Go install: $arch" ;;
+  esac
+  case "$os" in
+    linux|darwin) ;;
+    *) fail "unsupported OS for local Go install: $os" ;;
+  esac
+  ts "go not found; installing local Go into $local_go"
+  go_file="$(curl -fsSL 'https://go.dev/dl/?mode=json' | python3 -c 'import json,sys; os=sys.argv[1]; arch=sys.argv[2]; data=json.load(sys.stdin); print(next(f["filename"] for f in data[0]["files"] if f["os"]==os and f["arch"]==arch and f["filename"].endswith(".tar.gz")))' "$os" "$arch")"
+  go_archive="$CACHE_DIR/$go_file"
+  if [ ! -f "$go_archive" ] || [ "${NRTUI_REFRESH:-0}" = "1" ]; then
+    ts "download: https://go.dev/dl/$go_file"
+    curl -fL --progress-bar "https://go.dev/dl/$go_file" -o "$go_archive"
+  else
+    ts "using cached Go archive: $go_archive"
+  fi
+  rm -rf "$local_go" "$CACHE_DIR/go-extract"
+  mkdir -p "$CACHE_DIR/go-extract" "$(dirname "$local_go")"
+  tar -xzf "$go_archive" -C "$CACHE_DIR/go-extract"
+  mv "$CACHE_DIR/go-extract/go" "$local_go"
+  export PATH="$local_go/bin:$PATH"
+}
+
+ensure_go
 
 archive="$CACHE_DIR/9rtui-$BRANCH.tar.gz"
 url="https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz"
