@@ -5,6 +5,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHARE="${NRTUI_PC_SHARE:-/home/hilman/pc-share/9rtui}"
 OWNER="${NRTUI_OWNER:-hilman:hilman}"
 cd "$ROOT"
+VERSION="${NRTUI_VERSION:-v0.1.1-beta}"
+COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+LDFLAGS="-X main.version=$VERSION -X main.commit=$COMMIT -X main.buildDate=$BUILD_DATE"
 
 if ! command -v go >/dev/null 2>&1; then
   echo "ERROR: go not found" >&2
@@ -15,10 +19,10 @@ echo "==> test"
 go test ./...
 
 echo "==> build linux: $ROOT/9rtui"
-go build -o "$ROOT/9rtui" .
+go build -ldflags "$LDFLAGS" -o "$ROOT/9rtui" .
 
 echo "==> build windows: $ROOT/9rtui.exe"
-GOOS=windows GOARCH=amd64 go build -o "$ROOT/9rtui.exe" .
+GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "$ROOT/9rtui.exe" .
 
 echo "==> copy windows exe to share: $SHARE/9rtui.exe"
 mkdir -p "$SHARE" 2>/dev/null || sudo mkdir -p "$SHARE"

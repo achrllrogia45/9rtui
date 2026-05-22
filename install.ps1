@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $Repo = if ($env:NRTUI_REPO) { $env:NRTUI_REPO } else { "achrllrogia45/9rtui" }
-$Version = if ($env:NRTUI_VERSION) { $env:NRTUI_VERSION } else { "v0.1beta" }
+$Version = if ($env:NRTUI_VERSION) { $env:NRTUI_VERSION } else { "v0.1.1-beta" }
 $Branch = if ($env:NRTUI_BRANCH) { $env:NRTUI_BRANCH } else { "main" }
 $HomeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $InstallDir = if ($env:NRTUI_INSTALL_DIR) { $env:NRTUI_INSTALL_DIR } else { Join-Path $HomeDir ".9rtui" }

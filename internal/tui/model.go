@@ -1273,11 +1273,19 @@ func (m Model) footerView() string {
 
 func (m Model) defaultUpdateReleases() []updateRelease {
 	asset := updateAssetName()
-	url := "https://github.com/achrllrogia45/9rtui/releases/download/v0.1beta/" + asset
+	current := firstNonEmptyString(m.version, "dev")
+	mk := func(tag, kind, summary string) updateRelease {
+		state := "older"
+		if tag == current {
+			state = "current"
+		} else if tag == "v0.1.1-beta" && current != "v0.1.1-beta" {
+			state = "newer"
+		}
+		return updateRelease{Tag: tag, Kind: kind, State: state, URL: "https://github.com/achrllrogia45/9rtui/releases/download/" + tag + "/" + asset, Asset: asset, Summary: summary}
+	}
 	return []updateRelease{
-		{Tag: "v0.2.0-beta.1", Kind: "beta", State: "newer", URL: url, Asset: asset, Summary: "available update preview"},
-		{Tag: firstNonEmptyString(m.version, "v0.1beta"), Kind: "beta", State: "current", URL: url, Asset: asset, Summary: "current installed release"},
-		{Tag: "v0.0.9-alpha", Kind: "alpha", State: "older", URL: url, Asset: asset, Summary: "older test release"},
+		mk("v0.1.1-beta", "beta", "new beta, idk still beta lmao"),
+		mk("v0.1beta", "beta", "old beta fallback / downgrade"),
 	}
 }
 

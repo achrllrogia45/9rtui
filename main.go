@@ -188,7 +188,7 @@ func setupRuntime() (map[string]string, string, error) {
 	if exe, err := os.Executable(); err == nil {
 		_ = os.Setenv("NRTUI_BINARY_PATH", exe)
 	}
-	_ = os.Setenv("NRTUI_RELEASE_URL", "https://github.com/achrllrogia45/9rtui/releases/latest")
+	_ = os.Setenv("NRTUI_RELEASE_URL", "https://github.com/achrllrogia45/9rtui/releases/tag/v0.1.1-beta")
 	if strings.TrimSpace(os.Getenv("NRTUI_ACCOUNTS_PATH")) == "" {
 		_ = os.Setenv("NRTUI_ACCOUNTS_PATH", accountsPath+string(os.PathSeparator))
 	}

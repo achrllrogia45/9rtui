@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="${NRTUI_REPO:-achrllrogia45/9rtui}"
-VERSION="${NRTUI_VERSION:-v0.1beta}"
+VERSION="${NRTUI_VERSION:-v0.1.1-beta}"
 BRANCH="${NRTUI_BRANCH:-main}"
 INSTALL_DIR="${NRTUI_INSTALL_DIR:-$HOME/.9rtui}"
 BIN_DIR="${NRTUI_BIN_DIR:-$HOME/.local/bin}"
