@@ -1,5 +1,29 @@
 package tui
 
 func helpView() string {
-	return box.Render(brand.Render(" Hotkeys ") + "\n\n" + "j/k        move\nh/l        focus pane\ngg/G       top/bottom\nEnter/i    inspect account JSON\n  e        export inspected JSON to ./.accounts/\nSpace      toggle account\nv          visual select range\na/A        select all visible / clear\nd          delete selected (writes tiny ./.tui-logs undo log)\nb/B        recovery/maintenance\n  R        restore selected undo log\n  C        clean request/usage logs + VACUUM\n  F        full SQLite snapshot (.bak/.bak2)\nU          update center\nr          refresh\nq          quit\nEsc        cancel")
+	return box.Render(brand.Render(" Help / Hotkeys ") + "\n\n" +
+		"Navigation\n" +
+		"  j/k, arrows      move\n" +
+		"  h/l              focus provider/accounts pane\n" +
+		"  gg/G             top/bottom\n" +
+		"\nAccounts\n" +
+		"  Enter/i          inspect account JSON\n" +
+		"  e                export inspected JSON to .accounts\n" +
+		"  Space            toggle account selection\n" +
+		"  v                visual select range\n" +
+		"  a/A              select all visible / clear\n" +
+		"  d                delete selected (writes undo log first)\n" +
+		"  O                on/off selected\n" +
+		"\nMenus\n" +
+		"  b/B              recovery + restore logs\n" +
+		"  /                more options (Indexing, Vacuum)\n" +
+		"  U                update center\n" +
+		"  I                import\n" +
+		"\nSafety\n" +
+		"  Index/Vacuum     yellow warning, force-stop 9Router, daily backup first\n" +
+		"  Backup path      .9router/db/backup/data.sqlite.bak-YYYYMMDD-HHMM\n" +
+		"\nGeneral\n" +
+		"  r                refresh\n" +
+		"  ?                this help\n" +
+		"  Esc/q            back / quit")
 }

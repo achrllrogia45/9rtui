@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -17,6 +18,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/9rtui/9rtui/internal/importer"
+	"github.com/9rtui/9rtui/internal/repo"
+	"github.com/9rtui/9rtui/internal/routerapi"
 	"github.com/9rtui/9rtui/internal/tui"
 	"github.com/9rtui/9rtui/internal/web"
 	tea "github.com/charmbracelet/bubbletea"
@@ -84,12 +88,57 @@ func main() {
 			}
 			fmt.Println("9rtui stopped")
 			return
+		case "doctor":
+			if err := runDoctor(cfg, db); err != nil {
+				os.Exit(1)
+			}
+			return
+		case "official-export":
+			if err := officialExportCLI(args[1:], cfg); err != nil {
+				fmt.Fprintln(os.Stderr, "official-export failed:", err)
+				os.Exit(1)
+			}
+			return
+		case "official-import":
+			if err := officialImportCLI(args[1:], db); err != nil {
+				fmt.Fprintln(os.Stderr, "official-import failed:", err)
+				os.Exit(1)
+			}
+			return
+		case "api-key":
+			if err := apiKeyCLI(args[1:], db); err != nil {
+				fmt.Fprintln(os.Stderr, "api-key failed:", err)
+				os.Exit(1)
+			}
+			return
+		case "import-file":
+			if err := importFileCLI(args[1:], db); err != nil {
+				fmt.Fprintln(os.Stderr, "import-file failed:", err)
+				os.Exit(1)
+			}
+			return
 		case "check-db":
 			if err := checkDB(db); err != nil {
 				fmt.Fprintln(os.Stderr, "DB FAILED:", err)
 				os.Exit(1)
 			}
 			fmt.Println("DB OK:", db)
+			return
+		case "index":
+			msg, err := repo.New(db).Reindex()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "INDEX FAILED:", err)
+				os.Exit(1)
+			}
+			fmt.Println(msg)
+			return
+		case "vacuum":
+			msg, err := repo.New(db).Vacuum()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "VACUUM FAILED:", err)
+				os.Exit(1)
+			}
+			fmt.Println(msg)
 			return
 		case "restart":
 			_ = web.StopHard(appDir)
@@ -109,6 +158,158 @@ func main() {
 	runTUI(db)
 }
 
+func runDoctor(cfg map[string]string, dbPath string) error {
+	hadErr := false
+	ok := func(name string, err error) {
+		if err != nil {
+			fmt.Printf("FAIL %-18s %v\n", name, err)
+			hadErr = true
+			return
+		}
+		fmt.Printf("OK   %s\n", name)
+	}
+	fmt.Printf("9rtui %s (commit %s, built %s)\n", version, commit, buildDate)
+	fmt.Println("db:", dbPath)
+	fmt.Println("api:", cfg["api_base"])
+	ok("db", checkDB(dbPath))
+	if _, err := routerapi.CLIToken(); err != nil {
+		ok("cli token", err)
+	} else {
+		ok("cli token", nil)
+	}
+	c, err := routerapi.New(cfg["api_base"])
+	if err != nil {
+		ok("official api", err)
+	} else {
+		b, err := c.ExportDatabase(context.Background())
+		ok("official api", err)
+		if err == nil {
+			fmt.Printf("OK   official counts providerConnections=%d apiKeys=%d\n", len(routerapi.ProviderConnections(b)), len(routerapi.APIKeys(b)))
+		}
+	}
+	keys, err := repo.New(dbPath).ListAPIKeys()
+	ok("apiKeys table", err)
+	if err == nil {
+		fmt.Printf("OK   apiKeys rows=%d\n", len(keys))
+	}
+	if hadErr {
+		return fmt.Errorf("doctor found failures")
+	}
+	return nil
+}
+
+func officialExportCLI(args []string, cfg map[string]string) error {
+	out := "official-backup-" + time.Now().Format("20060102-1504") + ".json"
+	if len(args) > 0 && strings.TrimSpace(args[0]) != "" {
+		out = args[0]
+	}
+	c, err := routerapi.New(cfg["api_base"])
+	if err != nil {
+		return err
+	}
+	b, err := c.ExportDatabase(context.Background())
+	if err != nil {
+		return err
+	}
+	bb, err := json.MarshalIndent(b, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(out, bb, 0600); err != nil {
+		return err
+	}
+	fmt.Println(out)
+	return nil
+}
+
+func officialImportCLI(args []string, dbPath string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: 9rtui official-import file.json")
+	}
+	r := repo.New(dbPath)
+	added, err := r.ImportAccountBundle(args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Println("imported", args[0])
+	fmt.Println("added", added)
+	return nil
+}
+
+func importFileCLI(args []string, dbPath string) error {
+	fs := flag.NewFlagSet("import-file", flag.ContinueOnError)
+	provider := fs.String("provider", "kiro", "provider: kiro|codex|antigravity")
+	file := fs.String("file", "", "accounts json file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *file == "" && fs.NArg() > 0 {
+		*file = fs.Arg(0)
+	}
+	if *file == "" {
+		return fmt.Errorf("usage: 9rtui import-file -provider kiro -file accounts.json")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	res, err := importer.RunProvider(ctx, importer.ImportOptions{AccountsPath: *file, DBPath: dbPath, DoImport: true, DryRun: false, ActiveOnly: false, IncludeInactive: true, OnlyAvailable: false, Parallel: 5}, *provider)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("imported provider=%s selected=%d ok=%d failed=%d\n", *provider, res.Selected, res.OK, res.Fail)
+	return nil
+}
+
+func apiKeyCLI(args []string, dbPath string) error {
+	r := repo.New(dbPath)
+	if len(args) == 0 || args[0] == "list" {
+		keys, err := r.ListAPIKeys()
+		if err != nil {
+			return err
+		}
+		for _, k := range keys {
+			fmt.Printf("%s\t%s\t%v\t%s\t%s\n", k.ID, repo.MaskKey(k.Key), k.IsActive, k.Name, k.CreatedAt)
+		}
+		return nil
+	}
+	switch args[0] {
+	case "create":
+		name, key := "", ""
+		if len(args) > 1 {
+			name = args[1]
+		}
+		if len(args) > 2 {
+			key = args[2]
+		}
+		k, err := r.CreateAPIKey(name, key)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("created\nid: %s\nname: %s\nkey: %s\n", k.ID, k.Name, k.Key)
+	case "edit":
+		if len(args) < 3 {
+			return fmt.Errorf("usage: 9rtui api-key edit <id> <name> [key]")
+		}
+		key := ""
+		if len(args) > 3 {
+			key = args[3]
+		}
+		return r.UpdateAPIKey(args[1], args[2], key)
+	case "toggle":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: 9rtui api-key toggle <id>")
+		}
+		return r.ToggleAPIKey(args[1])
+	case "delete":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: 9rtui api-key delete <id>")
+		}
+		return r.DeleteAPIKey(args[1])
+	default:
+		return fmt.Errorf("usage: 9rtui api-key list|create [name] [key]|edit <id> <name> [key]|toggle <id>|delete <id>")
+	}
+	return nil
+}
+
 func usage() {
 	out := flag.CommandLine.Output()
 	fmt.Fprintln(out, "9rtui - Terminal UI for 9Router accounts")
@@ -121,7 +322,14 @@ func usage() {
 	fmt.Fprintln(out, "  9rtui web start               run web TUI at localhost:20129")
 	fmt.Fprintln(out, "  9rtui web expose              run web TUI at 0.0.0.0:20129")
 	fmt.Fprintln(out, "  9rtui stop                    hard-stop all running 9rtui web servers")
+	fmt.Fprintln(out, "  9rtui doctor                  DB/API/token/API-key diagnostics")
+	fmt.Fprintln(out, "  9rtui official-export [file]  export official 9Router backup JSON")
+	fmt.Fprintln(out, "  9rtui official-import file    import official 9Router backup JSON")
+	fmt.Fprintln(out, "  9rtui api-key list|create|edit|toggle|delete")
+	fmt.Fprintln(out, "  9rtui import-file -provider kiro -file accounts.json")
 	fmt.Fprintln(out, "  9rtui check-db                verify configured 9Router DB")
+	fmt.Fprintln(out, "  9rtui index                   force-stop 9Router, daily backup, REINDEX")
+	fmt.Fprintln(out, "  9rtui vacuum                  force-stop 9Router, daily backup, VACUUM")
 	fmt.Fprintln(out, "  9rtui web stop                alias for stop")
 	fmt.Fprintln(out, "  9rtui web restart             restart web server")
 	fmt.Fprintln(out, "  9rtui restart                 restart web server")
@@ -137,6 +345,8 @@ func printConfig(cfg map[string]string, db string) {
 	fmt.Println("accounts_path:", resolveAppPath(expandConfigPath(cfg["accounts_path"])))
 	fmt.Println("api_base:", cfg["api_base"])
 	fmt.Println("dev_mode:", cfg["dev_mode"])
+	fmt.Println("auto_backup_method:", cfg["auto_backup_method"])
+	fmt.Println("snap_backup_method:", cfg["snap_backup_method"])
 	fmt.Println("version:", version)
 	fmt.Println("commit:", commit)
 	fmt.Println("built:", buildDate)
@@ -166,10 +376,20 @@ func setupRuntime() (map[string]string, string, error) {
 	if apiBase == "" {
 		apiBase = "http://localhost:20128"
 	}
+	autoMethod := firstNonEmpty(os.Getenv("NRTUI_AUTO_BACKUP_METHOD"), cfg["auto_backup_method"])
+	if autoMethod == "" {
+		autoMethod = "none"
+	}
+	snapMethod := firstNonEmpty(os.Getenv("NRTUI_SNAP_BACKUP_METHOD"), cfg["snap_backup_method"])
+	if snapMethod == "" {
+		snapMethod = "none"
+	}
 
 	cfg["db_path"] = portableConfigPath(db)
 	cfg["log_dir"] = localConfigPath(logDir)
 	cfg["api_base"] = apiBase
+	cfg["auto_backup_method"] = autoMethod
+	cfg["snap_backup_method"] = snapMethod
 	cfg["project_dir"] = "."
 	if cfg["accounts_path"] == "" || strings.Contains(filepath.Clean(cfg["accounts_path"]), string(os.PathSeparator)+"accounts") {
 		cfg["accounts_path"] = filepath.Join(appDir, ".accounts") + string(os.PathSeparator)
@@ -185,10 +405,13 @@ func setupRuntime() (map[string]string, string, error) {
 	_ = os.Setenv("NRTUI_LOG_DIR", logDir)
 	_ = os.Setenv("NRTUI_API", apiBase)
 	_ = os.Setenv("NRTUI_DEV_MODE", cfg["dev_mode"])
+	_ = os.Setenv("NRTUI_AUTO_BACKUP_METHOD", cfg["auto_backup_method"])
+	_ = os.Setenv("NRTUI_SNAP_BACKUP_METHOD", cfg["snap_backup_method"])
+	_ = os.Setenv("NRTUI_CONFIG_PATH", cfgPath)
 	if exe, err := os.Executable(); err == nil {
 		_ = os.Setenv("NRTUI_BINARY_PATH", exe)
 	}
-	_ = os.Setenv("NRTUI_RELEASE_URL", "https://github.com/achrllrogia45/9rtui/releases/tag/v0.1.1-beta")
+	_ = os.Setenv("NRTUI_RELEASE_URL", "https://github.com/achrllrogia45/9rtui/releases/tag/v0.2.0-beta.1")
 	if strings.TrimSpace(os.Getenv("NRTUI_ACCOUNTS_PATH")) == "" {
 		_ = os.Setenv("NRTUI_ACCOUNTS_PATH", accountsPath+string(os.PathSeparator))
 	}

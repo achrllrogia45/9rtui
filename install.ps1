@@ -1,8 +1,8 @@
 $ErrorActionPreference = "Stop"
 
 $Repo = if ($env:NRTUI_REPO) { $env:NRTUI_REPO } else { "achrllrogia45/9rtui" }
-$Version = if ($env:NRTUI_VERSION) { $env:NRTUI_VERSION } else { "v0.1.1-beta" }
-$Branch = if ($env:NRTUI_BRANCH) { $env:NRTUI_BRANCH } else { "main" }
+$Version = if ($env:NRTUI_VERSION) { $env:NRTUI_VERSION } else { $null }
+$Branch = if ($env:NRTUI_BRANCH) { $env:NRTUI_BRANCH } else { $null }
 $HomeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $InstallDir = if ($env:NRTUI_INSTALL_DIR) { $env:NRTUI_INSTALL_DIR } else { Join-Path $HomeDir ".9rtui" }
 $ApiBase = if ($env:NRTUI_API) { $env:NRTUI_API } else { "http://localhost:20128" }
@@ -12,7 +12,42 @@ $SrcDir = Join-Path $CacheDir "src"
 
 function Say($Message) { Write-Host $Message }
 function Fail($Message) { throw $Message }
+function Resolve-Version {
+    if ($script:Version) { return }
+    $Api = "https://api.github.com/repos/$Repo/releases/latest"
+    Say "resolve latest release: $Api"
+    try {
+        $Release = Invoke-RestMethod -Uri $Api -Headers @{ "User-Agent" = "9rtui-installer" }
+        $script:Version = $Release.tag_name
+    } catch {
+        Fail "failed to resolve latest release from $Api; set NRTUI_VERSION. $($_.Exception.Message)"
+    }
+    if (!$script:Version) { Fail "latest release response missing tag_name; set NRTUI_VERSION" }
+}
+function Download-File($Url, $OutPath) {
+    $Tmp = "$OutPath.tmp"
+    if (Test-Path $Tmp) { Remove-Item -Force $Tmp }
+    Invoke-WebRequest -Uri $Url -OutFile $Tmp
+    Move-Item -Force $Tmp $OutPath
+}
+function Install-Exe($Cached, $Exe) {
+    $StagedExe = Join-Path $InstallDir "9rtui.exe.new"
+    $BackupExe = Join-Path $InstallDir "9rtui.exe.old"
+    Copy-Item -Force $Cached $StagedExe
+    try {
+        if (Test-Path $BackupExe) { Remove-Item -Force $BackupExe }
+        if (Test-Path $Exe) { Move-Item -Force $Exe $BackupExe }
+        Move-Item -Force $StagedExe $Exe
+        if (Test-Path $BackupExe) { Remove-Item -Force $BackupExe }
+    } catch {
+        if (Test-Path $StagedExe) { Remove-Item -Force $StagedExe -ErrorAction SilentlyContinue }
+        if (!(Test-Path $Exe) -and (Test-Path $BackupExe)) { Move-Item -Force $BackupExe $Exe -ErrorAction SilentlyContinue }
+        Fail "failed to replace $Exe. Close running 9rtui.exe, then rerun installer. mybad Windows locks running exe. Original: $($_.Exception.Message)"
+    }
+}
 
+Resolve-Version
+$SourceRef = if ($Branch) { $Branch } else { $Version }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir ".accounts") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir ".tui-logs\full-backups") | Out-Null
@@ -28,11 +63,11 @@ $Asset = "9rtui-windows-$GoArch.exe"
 $Exe = Join-Path $InstallDir "9rtui.exe"
 
 function Sync-Scripts {
-    $Zip = Join-Path $CacheDir "9rtui-$Branch.zip"
-    $Url = "https://github.com/$Repo/archive/refs/heads/$Branch.zip"
+    $Zip = Join-Path $CacheDir "9rtui-$SourceRef.zip"
+    if ($Branch) { $Url = "https://github.com/$Repo/archive/refs/heads/$Branch.zip" } else { $Url = "https://github.com/$Repo/archive/refs/tags/$SourceRef.zip" }
     if (!(Test-Path $Zip) -or $env:NRTUI_REFRESH -eq "1") {
         Say "download scripts/source: $Url"
-        Invoke-WebRequest -Uri $Url -OutFile $Zip
+        Download-File $Url $Zip
     }
     $ExtractDir = Join-Path $CacheDir "extract"
     if (Test-Path $SrcDir) { Remove-Item -Recurse -Force $SrcDir }
@@ -63,12 +98,12 @@ if ($env:NRTUI_BUILD_FROM_SOURCE -eq "1") {
     Build-FromSource
 } else {
     $Url = "https://github.com/$Repo/releases/download/$Version/$Asset"
-    $Cached = Join-Path $CacheDir $Asset
+    $Cached = Join-Path $CacheDir "$Asset-$Version"
     if (!(Test-Path $Cached) -or $env:NRTUI_REFRESH -eq "1") {
         Say "download binary: $Url"
-        Invoke-WebRequest -Uri $Url -OutFile $Cached
+        Download-File $Url $Cached
     }
-    Copy-Item -Force $Cached $Exe
+    Install-Exe $Cached $Exe
     Sync-Scripts
 }
 
@@ -94,6 +129,7 @@ if ($UserPath -notlike "*$InstallDir*") {
     Say "Added to user PATH. Restart terminal to use 9rtui globally."
 }
 
+Say "version:   $Version"
 Say "installed: $Exe"
 Say "scripts:   $(Join-Path $InstallDir "scripts")"
 Say "config:    $IniPath"

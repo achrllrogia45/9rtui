@@ -1,11 +1,15 @@
 package repo
 
 import (
+	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -13,6 +17,7 @@ import (
 	"time"
 
 	"github.com/9rtui/9rtui/internal/domain"
+	"github.com/9rtui/9rtui/internal/routerapi"
 	_ "modernc.org/sqlite"
 )
 
@@ -56,6 +61,69 @@ func defaultAccountsDir() string {
 	return "./.accounts"
 }
 
+func (r *Repo) officialClient() (*routerapi.Client, error) {
+	return routerapi.New(os.Getenv("NRTUI_API"))
+}
+
+func (r *Repo) officialExport(ctx context.Context) (routerapi.Backup, error) {
+	c, err := r.officialClient()
+	if err != nil {
+		return nil, err
+	}
+	return c.ExportDatabase(ctx)
+}
+
+func (r *Repo) officialImport(ctx context.Context, b routerapi.Backup) error {
+	c, err := r.officialClient()
+	if err != nil {
+		return err
+	}
+	return c.ImportDatabase(ctx, b)
+}
+
+func (r *Repo) ImportAccountBundle(path string) (int64, error) {
+	incoming, err := bundleConnectionsFromFile(path)
+	if err != nil {
+		return 0, err
+	}
+	if len(incoming) == 0 {
+		return 0, fmt.Errorf("import file has no providerConnections")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	backup, err := r.officialExport(ctx)
+	if err != nil {
+		return 0, err
+	}
+	conns := routerapi.ProviderConnections(backup)
+	added := mergeMissingConnections(&conns, incoming)
+	routerapi.SetProviderConnections(backup, conns)
+	if added == 0 {
+		return 0, nil
+	}
+	if err := r.officialImport(ctx, backup); err != nil {
+		return added, err
+	}
+	return added, nil
+}
+
+func accountExportFromOfficial(c map[string]any) domain.AccountExport {
+	pick := func(k string) string { s, _ := c[k].(string); return s }
+	pri := 0
+	if f, ok := c["priority"].(float64); ok {
+		pri = int(f)
+	}
+	data := map[string]any{}
+	for k, v := range c {
+		switch k {
+		case "id", "provider", "authType", "name", "email", "priority", "isActive", "createdAt", "updatedAt":
+		default:
+			data[k] = v
+		}
+	}
+	return domain.AccountExport{ID: pick("id"), Provider: pick("provider"), AuthType: pick("authType"), Name: pick("name"), Email: pick("email"), Priority: pri, IsActive: routerapi.Bool(c["isActive"]), Data: data, CreatedAt: pick("createdAt"), UpdatedAt: pick("updatedAt")}
+}
+
 type accountRow struct {
 	ID        string `json:"id"`
 	Provider  string `json:"provider"`
@@ -82,10 +150,280 @@ type UndoInfo struct {
 	ProviderCount map[string]int
 }
 
+type APIKey struct {
+	ID        string
+	Key       string
+	Name      string
+	MachineID string
+	IsActive  bool
+	CreatedAt string
+}
+
+func (r *Repo) ListAPIKeys() ([]APIKey, error) {
+	db, err := r.open()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT id, key, COALESCE(name,''), COALESCE(machineId,''), COALESCE(isActive,0), COALESCE(createdAt,'') FROM apiKeys ORDER BY createdAt DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []APIKey
+	for rows.Next() {
+		var k APIKey
+		var active int
+		if err := rows.Scan(&k.ID, &k.Key, &k.Name, &k.MachineID, &active, &k.CreatedAt); err != nil {
+			return nil, err
+		}
+		k.IsActive = active != 0
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func MaskKey(s string) string {
+	if len(s) <= 10 {
+		return s
+	}
+	return s[:6] + "..." + s[len(s)-4:]
+}
+
+func (r *Repo) CreateAPIKey(name, key string) (APIKey, error) {
+	name = strings.TrimSpace(name)
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = "sk-" + randomHex(24)
+	}
+	if len(key) < 8 || strings.ContainsAny(key, " \t\r\n") {
+		return APIKey{}, fmt.Errorf("invalid api key: need >=8 chars and no whitespace")
+	}
+	db, err := r.open()
+	if err != nil {
+		return APIKey{}, err
+	}
+	defer db.Close()
+	id := uuidLike()
+	machine := machineIDFromRouterHome()
+	created := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	_, err = db.Exec(`INSERT INTO apiKeys (id, key, name, machineId, isActive, createdAt) VALUES (?, ?, ?, ?, 1, ?)`, id, key, name, machine, created)
+	if err != nil {
+		return APIKey{}, err
+	}
+	return APIKey{ID: id, Key: key, Name: name, MachineID: machine, IsActive: true, CreatedAt: created}, nil
+}
+
+func (r *Repo) UpdateAPIKey(id, name, key string) error {
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	key = strings.TrimSpace(key)
+	if id == "" {
+		return fmt.Errorf("api key id required")
+	}
+	if key != "" && (len(key) < 8 || strings.ContainsAny(key, " \t\r\n")) {
+		return fmt.Errorf("invalid api key: need >=8 chars and no whitespace")
+	}
+	db, err := r.open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if key == "" {
+		_, err = db.Exec(`UPDATE apiKeys SET name=? WHERE id=?`, name, id)
+	} else {
+		_, err = db.Exec(`UPDATE apiKeys SET name=?, key=? WHERE id=?`, name, key, id)
+	}
+	return err
+}
+
+func (r *Repo) ToggleAPIKey(id string) error {
+	db, err := r.open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec(`UPDATE apiKeys SET isActive=CASE WHEN COALESCE(isActive,0)=0 THEN 1 ELSE 0 END WHERE id=?`, strings.TrimSpace(id))
+	return err
+}
+
+func (r *Repo) DeleteAPIKey(id string) error {
+	db, err := r.open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec(`DELETE FROM apiKeys WHERE id=?`, strings.TrimSpace(id))
+	return err
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+func uuidLike() string {
+	s := randomHex(16)
+	if len(s) < 32 {
+		return s
+	}
+	return s[:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:]
+}
+
+func machineIDFromRouterHome() string {
+	base := os.Getenv("DATA_DIR")
+	if base == "" {
+		home, _ := os.UserHomeDir()
+		base = filepath.Join(home, ".9router")
+	}
+	b, _ := os.ReadFile(filepath.Join(base, "machine-id"))
+	return strings.TrimSpace(string(b))
+}
+
+type BackupSlot string
+
+const (
+	BackupSnap   BackupSlot = "snap"
+	BackupAuto   BackupSlot = "auto"
+	BackupVacIdx BackupSlot = "vacidx"
+)
+
+type BackupCopyMethod string
+
+const (
+	BackupCopyNone          BackupCopyMethod = "none"
+	BackupCopyVacuum        BackupCopyMethod = "vacuum"
+	BackupCopyVacuumCleanup BackupCopyMethod = "vacuum_cleanup"
+)
+
+func ParseBackupCopyMethod(s string) (BackupCopyMethod, error) {
+	switch BackupCopyMethod(strings.TrimSpace(s)) {
+	case "", BackupCopyNone:
+		return BackupCopyNone, nil
+	case BackupCopyVacuum:
+		return BackupCopyVacuum, nil
+	case BackupCopyVacuumCleanup:
+		return BackupCopyVacuumCleanup, nil
+	default:
+		return "", fmt.Errorf("invalid backup method %q (want none|vacuum|vacuum_cleanup)", s)
+	}
+}
+
 func (r *Repo) LogsDir() string   { return r.logDir }
 func (r *Repo) backupDir() string { return filepath.Join(r.LogsDir(), "full-backups") }
 func (r *Repo) bak1() string      { return filepath.Join(r.backupDir(), filepath.Base(r.Path)) }
 func (r *Repo) bak2() string      { return filepath.Join(r.backupDir(), filepath.Base(r.Path)) }
+
+func (r *Repo) routerBackupDir() string { return filepath.Join(filepath.Dir(r.Path), "backup") }
+func (r *Repo) backupSlotPath(slot BackupSlot) string {
+	return filepath.Join(r.routerBackupDir(), filepath.Base(r.Path)+".bak-"+string(slot))
+}
+func (r *Repo) backupSidecarPath(slot BackupSlot) string { return r.backupSlotPath(slot) + ".txt" }
+
+func (r *Repo) BackupSlot(slot BackupSlot, method BackupCopyMethod) (string, error) {
+	if method == "" {
+		method = BackupCopyNone
+	}
+	path := r.backupSlotPath(slot)
+	before := fileSize(r.Path)
+	if err := sqliteBackupWithMethod(r.Path, path, method); err != nil {
+		return "", err
+	}
+	after := fileSize(path)
+	if err := r.writeBackupSidecar(slot, method, before, after); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (r *Repo) Snapshot(method BackupCopyMethod) (string, error) {
+	return r.BackupSlot(BackupSnap, method)
+}
+func (r *Repo) EnsureDailyBackup() (string, error) {
+	return r.EnsureDailyBackupWithMethod(BackupCopyNone)
+}
+func (r *Repo) EnsureDailyBackupWithMethod(method BackupCopyMethod) (string, error) {
+	if method == "" {
+		method = BackupCopyNone
+	}
+	path := r.backupSlotPath(BackupAuto)
+	metaPath := r.backupSidecarPath(BackupAuto)
+	if st, err := os.Stat(metaPath); err == nil && time.Now().Format("20060102") == st.ModTime().Format("20060102") {
+		if b, err := os.ReadFile(metaPath); err == nil && strings.Contains(string(b), "method="+string(method)+"\n") {
+			return path, nil
+		}
+	}
+	return r.BackupSlot(BackupAuto, method)
+}
+func (r *Repo) ForceTimestampBackup() (string, error) {
+	return r.BackupSlot(BackupVacIdx, BackupCopyVacuum)
+}
+
+func (r *Repo) writeBackupSidecar(slot BackupSlot, method BackupCopyMethod, before, after int64) error {
+	body := fmt.Sprintf("created_at=%s\nmethod=%s\noperation=%s\nsource=%s\nbackup=%s\nbefore_size=%s\nafter_size=%s\n", time.Now().Format("20060102-1504"), method, slot, r.Path, r.backupSlotPath(slot), humanBytes(before), humanBytes(after))
+	return os.WriteFile(r.backupSidecarPath(slot), []byte(body), 0600)
+}
+
+func fileSize(path string) int64 {
+	st, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return st.Size()
+}
+
+func Kill9Router() string {
+	if runtime.GOOS == "windows" {
+		_ = exec.Command("taskkill", "/f", "/im", "node.exe").Run()
+		return "taskkill /f /im node.exe"
+	}
+	_ = exec.Command("pkill", "-9", "9router").Run()
+	return "pkill -9 9router"
+}
+
+func (r *Repo) Reindex() (string, error) { return r.ReindexWithBackup(BackupCopyNone) }
+func (r *Repo) ReindexWithBackup(method BackupCopyMethod) (string, error) {
+	kill := Kill9Router()
+	db, err := r.open()
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	if _, err := db.Exec(`REINDEX`); err != nil {
+		return "", err
+	}
+	if err := accountCheck(db); err != nil {
+		return "", err
+	}
+	backup, err := r.BackupSlot(BackupVacIdx, method)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s; REINDEX done; backup: %s (%s)", kill, backup, method), nil
+}
+
+func (r *Repo) Vacuum() (string, error) { return r.VacuumWithBackup(BackupCopyNone) }
+func (r *Repo) VacuumWithBackup(method BackupCopyMethod) (string, error) {
+	kill := Kill9Router()
+	db, err := r.open()
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	before := fileSize(r.Path)
+	if _, err := db.Exec(`VACUUM`); err != nil {
+		return "", err
+	}
+	after := fileSize(r.Path)
+	backup, err := r.BackupSlot(BackupVacIdx, method)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s; vacuum: %s -> %s; backup: %s (%s)", kill, humanBytes(before), humanBytes(after), backup, method), nil
+}
 
 func (r *Repo) ListAccounts() ([]domain.Account, error) {
 	db, err := r.open()
@@ -165,17 +503,33 @@ func (r *Repo) GetAccounts(ids []string) ([]domain.AccountExport, error) {
 }
 
 func (r *Repo) ExportAccounts(ids []string) (string, error) {
-	xs, err := r.GetAccounts(ids)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	backup, err := r.officialExport(ctx)
 	if err != nil {
 		return "", err
 	}
-	payload := map[string]any{
-		"warning":   "contains full 9Router account credentials/secrets",
-		"createdAt": time.Now().Format(time.RFC3339),
-		"count":     len(xs),
-		"accounts":  xs,
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
 	}
-	b, err := json.MarshalIndent(payload, "", "  ")
+	conns := routerapi.ProviderConnections(backup)
+	kept := make([]map[string]any, 0, len(conns))
+	var xs []domain.AccountExport
+	for _, c := range conns {
+		id := routerapi.AccountID(c)
+		if len(want) > 0 && !want[id] {
+			continue
+		}
+		kept = append(kept, c)
+		xs = append(xs, accountExportFromOfficial(c))
+	}
+	bundle := map[string]any{
+		"format":              "9router-providerConnections-v1",
+		"createdAt":           time.Now().UTC().Format(time.RFC3339),
+		"providerConnections": kept,
+	}
+	b, err := json.MarshalIndent(bundle, "", "  ")
 	if err != nil {
 		return "", err
 	}
@@ -218,63 +572,147 @@ func (r *Repo) readRows(tx *sql.Tx, ids []string) ([]accountRow, error) {
 	return rows, nil
 }
 
-func (r *Repo) writeUndoLog(rows []accountRow) (string, error) {
-	if len(rows) == 0 {
+func accountBundle(conns []map[string]any, reason string, now time.Time) map[string]any {
+	return map[string]any{
+		"providerConnections": conns,
+	}
+}
+
+func writeAccountBundle(path string, conns []map[string]any, reason string) error {
+	bb, err := json.MarshalIndent(accountBundle(conns, reason, time.Now()), "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(bb, '\n'), 0600)
+}
+
+func providerCountFromConnections(conns []map[string]any) map[string]int {
+	out := map[string]int{}
+	for _, c := range conns {
+		if p, _ := c["provider"].(string); p != "" {
+			out[p]++
+		}
+	}
+	return out
+}
+
+func bundleConnectionsFromFile(path string) ([]map[string]any, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(b, &root); err != nil {
+		return nil, err
+	}
+	return routerapi.ProviderConnections(routerapi.Backup(root)), nil
+}
+
+func refreshTokenOf(c map[string]any) string {
+	if s, _ := c["refreshToken"].(string); strings.TrimSpace(s) != "" {
+		return strings.TrimSpace(s)
+	}
+	if data, ok := c["data"].(map[string]any); ok {
+		if s, _ := data["refreshToken"].(string); strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	if s, _ := c["data"].(string); strings.TrimSpace(s) != "" {
+		var m map[string]any
+		if json.Unmarshal([]byte(s), &m) == nil {
+			if rt, _ := m["refreshToken"].(string); strings.TrimSpace(rt) != "" {
+				return strings.TrimSpace(rt)
+			}
+		}
+	}
+	return ""
+}
+
+func connectionID(c map[string]any) string {
+	if s, _ := c["id"].(string); strings.TrimSpace(s) != "" {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+func mergeMissingConnections(conns *[]map[string]any, incoming []map[string]any) int64 {
+	seenRefresh := map[string]bool{}
+	seenID := map[string]bool{}
+	for _, c := range *conns {
+		if rt := refreshTokenOf(c); rt != "" {
+			seenRefresh[rt] = true
+		}
+		if id := connectionID(c); id != "" {
+			seenID[id] = true
+		}
+	}
+	var added int64
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, c := range incoming {
+		if rt := refreshTokenOf(c); rt != "" {
+			if seenRefresh[rt] {
+				continue
+			}
+			seenRefresh[rt] = true
+		} else if id := connectionID(c); id != "" {
+			if seenID[id] {
+				continue
+			}
+			seenID[id] = true
+		} else {
+			continue
+		}
+		if _, ok := c["createdAt"]; !ok {
+			c["createdAt"] = now
+		}
+		c["updatedAt"] = now
+		*conns = append(*conns, c)
+		added++
+	}
+	return added
+}
+
+func (r *Repo) writeDeleteLog(conns []map[string]any) (string, error) {
+	if len(conns) == 0 {
 		return "", nil
 	}
 	if err := os.MkdirAll(r.LogsDir(), 0755); err != nil {
 		return "", err
 	}
-	log := UndoLog{Op: "delete-providerConnections", CreatedAt: time.Now().Format(time.RFC3339), Rows: rows}
-	b, err := json.MarshalIndent(log, "", "  ")
-	if err != nil {
-		return "", err
+	xs := make([]domain.AccountExport, 0, len(conns))
+	for _, c := range conns {
+		xs = append(xs, accountExportFromOfficial(c))
 	}
-	path := filepath.Join(r.LogsDir(), deleteLogFileName(rows, time.Now()))
-	return path, os.WriteFile(path, b, 0600)
+	path := filepath.Join(r.LogsDir(), deleteBundleFileName(xs, time.Now()))
+	return path, writeAccountBundle(path, conns, "delete")
 }
 
 func (r *Repo) SetAccountsActive(ids []string, active bool) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	if err := ensureDevDBPath(r.Path); err != nil {
-		return 0, err
-	}
-	db, err := r.open()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	backup, err := r.officialExport(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
-	tx, err := db.Begin()
-	if err != nil {
-		return 0, err
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
 	}
-	val := 0
-	if active {
-		val = 1
-	}
-	stmt, err := tx.Prepare(`UPDATE providerConnections SET isActive = ?, updatedAt = ? WHERE id = ?`)
-	if err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	defer stmt.Close()
+	conns := routerapi.ProviderConnections(backup)
 	now := time.Now().UTC().Format(time.RFC3339)
 	var total int64
-	for _, id := range ids {
-		res, err := stmt.Exec(val, now, id)
-		if err != nil {
-			tx.Rollback()
-			return 0, err
+	for _, c := range conns {
+		if want[routerapi.AccountID(c)] {
+			c["isActive"] = active
+			c["updatedAt"] = now
+			total++
 		}
-		n, _ := res.RowsAffected()
-		total += n
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	if err := accountCheck(db); err != nil {
+	routerapi.SetProviderConnections(backup, conns)
+	if err := r.officialImport(ctx, backup); err != nil {
 		return total, err
 	}
 	return total, nil
@@ -284,50 +722,36 @@ func (r *Repo) DeleteAccounts(ids []string) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	if err := ensureDevDBPath(r.Path); err != nil {
-		return 0, err
-	}
-	db, err := r.open()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	backup, err := r.officialExport(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
-	tx, err := db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	rows, err := r.readRows(tx, ids)
-	if err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	if _, err := r.writeUndoLog(rows); err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	stmt, err := tx.Prepare(`DELETE FROM providerConnections WHERE id = ?`)
-	if err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	defer stmt.Close()
-	var total int64
+	want := map[string]bool{}
 	for _, id := range ids {
-		res, err := stmt.Exec(id)
-		if err != nil {
-			tx.Rollback()
-			return 0, err
+		want[id] = true
+	}
+	conns := routerapi.ProviderConnections(backup)
+	kept := make([]map[string]any, 0, len(conns))
+	deletedConns := make([]map[string]any, 0, len(ids))
+	var deleted int64
+	for _, c := range conns {
+		if want[routerapi.AccountID(c)] {
+			deleted++
+			deletedConns = append(deletedConns, c)
+			continue
 		}
-		n, _ := res.RowsAffected()
-		total += n
+		kept = append(kept, c)
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
+	if _, err := r.writeDeleteLog(deletedConns); err != nil {
+		return deleted, err
 	}
-	if err := accountCheck(db); err != nil {
-		return total, err
+	routerapi.SetProviderConnections(backup, kept)
+	if err := r.officialImport(ctx, backup); err != nil {
+		return deleted, err
 	}
-	return total, nil
+	return deleted, nil
 }
 
 func ensureDevDBPath(path string) error {
@@ -392,18 +816,33 @@ func (r *Repo) UndoLogs() ([]UndoInfo, error) {
 		if err != nil {
 			continue
 		}
-		var log UndoLog
-		if err := json.Unmarshal(b, &log); err != nil || len(log.Rows) == 0 {
-			var rows []accountRow
-			if err2 := json.Unmarshal(b, &rows); err2 != nil || len(rows) == 0 {
+		var root map[string]any
+		if err := json.Unmarshal(b, &root); err != nil {
+			continue
+		}
+		conns := routerapi.ProviderConnections(routerapi.Backup(root))
+		if len(conns) == 0 {
+			var log UndoLog
+			if err := json.Unmarshal(b, &log); err != nil || len(log.Rows) == 0 {
 				continue
 			}
-			log.Rows = rows
+			conns = make([]map[string]any, 0, len(log.Rows))
+			for _, row := range log.Rows {
+				m := map[string]any{"id": row.ID, "provider": row.Provider, "authType": row.AuthType, "name": row.Name, "email": row.Email, "priority": row.Priority, "isActive": row.IsActive != 0, "createdAt": row.CreatedAt, "updatedAt": row.UpdatedAt}
+				if strings.TrimSpace(row.Data) != "" {
+					var data map[string]any
+					if json.Unmarshal([]byte(row.Data), &data) == nil {
+						for k, v := range data {
+							m[k] = v
+						}
+					} else {
+						m["data"] = row.Data
+					}
+				}
+				conns = append(conns, m)
+			}
 		}
-		info := UndoInfo{Path: p, Modified: st.ModTime().Format(time.RFC3339), Size: st.Size(), Accounts: len(log.Rows), ProviderCount: map[string]int{}}
-		for _, row := range log.Rows {
-			info.ProviderCount[row.Provider]++
-		}
+		info := UndoInfo{Path: p, Modified: st.ModTime().Format(time.RFC3339), Size: st.Size(), Accounts: len(conns), ProviderCount: providerCountFromConnections(conns)}
 		out = append(out, info)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Modified > out[j].Modified })
@@ -414,40 +853,26 @@ func (r *Repo) RestoreUndo(path string) (int64, error) {
 	if filepath.Dir(path) != r.LogsDir() {
 		return 0, fmt.Errorf("restore log must be under .tui-logs")
 	}
-	b, err := os.ReadFile(path)
+	incoming, err := bundleConnectionsFromFile(path)
 	if err != nil {
 		return 0, err
 	}
-	var log UndoLog
-	if err := json.Unmarshal(b, &log); err != nil {
-		return 0, err
+	if len(incoming) == 0 {
+		return 0, fmt.Errorf("restore log has no providerConnections")
 	}
-	db, err := r.open()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	backup, err := r.officialExport(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
-	tx, err := db.Begin()
-	if err != nil {
-		return 0, err
+	conns := routerapi.ProviderConnections(backup)
+	restored := mergeMissingConnections(&conns, incoming)
+	routerapi.SetProviderConnections(backup, conns)
+	if err := r.officialImport(ctx, backup); err != nil {
+		return restored, err
 	}
-	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO providerConnections (id,provider,authType,name,email,priority,isActive,data,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-	if err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	defer stmt.Close()
-	var n int64
-	for _, x := range log.Rows {
-		res, err := stmt.Exec(x.ID, x.Provider, x.AuthType, x.Name, x.Email, x.Priority, x.IsActive, x.Data, x.CreatedAt, x.UpdatedAt)
-		if err != nil {
-			tx.Rollback()
-			return 0, err
-		}
-		a, _ := res.RowsAffected()
-		n += a
-	}
-	return n, tx.Commit()
+	return restored, nil
 }
 
 func (r *Repo) CleanVacuum() (string, error) {
@@ -729,14 +1154,14 @@ func providerAbbrev(provider string) string {
 	return safeName(p)
 }
 
-func deleteLogFileName(rows []accountRow, now time.Time) string {
+func deleteBundleFileName(xs []domain.AccountExport, now time.Time) string {
 	suffix := timestampSuffix(now)
-	if len(rows) == 1 {
-		x := rows[0]
+	if len(xs) == 1 {
+		x := xs[0]
 		base := firstNonEmpty(x.Email, x.Name, x.ID)
 		return safeName(base) + "-delete-" + suffix + ".json"
 	}
-	return fmt.Sprintf("delete-%d-accounts-%s.json", len(rows), suffix)
+	return fmt.Sprintf("delete-%d-accounts-%s.json", len(xs), suffix)
 }
 
 func timestampSuffix(t time.Time) string { return t.Format("20060102-1504") }
@@ -750,7 +1175,41 @@ func firstNonEmpty(xs ...string) string {
 	return "unknown"
 }
 
-func sqliteBackup(src, dst string) error {
+func sqliteBackup(src, dst string) error { return sqliteBackupWithMethod(src, dst, BackupCopyVacuum) }
+
+func sqliteBackupWithMethod(src, dst string, method BackupCopyMethod) error {
+	switch method {
+	case "", BackupCopyNone:
+		return sqliteBackupCopy(src, dst)
+	case BackupCopyVacuum:
+		return sqliteBackupVacuumInto(src, dst)
+	case BackupCopyVacuumCleanup:
+		return sqliteBackupVacuumCleanup(src, dst)
+	default:
+		return fmt.Errorf("unknown backup method: %s", method)
+	}
+}
+
+func sqliteBackupCopy(src, dst string) error {
+	db, err := sql.Open("sqlite", sqliteFileDSN(src, "_busy_timeout=10000"))
+	if err != nil {
+		return err
+	}
+	_, ckErr := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	closeErr := db.Close()
+	if ckErr != nil {
+		return ckErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := copyFile(src, dst); err != nil {
+		return err
+	}
+	return verifySQLite(dst)
+}
+
+func sqliteBackupVacuumInto(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
@@ -771,6 +1230,39 @@ func sqliteBackup(src, dst string) error {
 		return err
 	}
 	return os.Rename(tmp, dst)
+}
+
+func sqliteBackupVacuumCleanup(src, dst string) error {
+	if err := sqliteBackupVacuumInto(src, dst); err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", sqliteFileDSN(dst, "_busy_timeout=10000"))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	for _, table := range []string{"requestDetails", "usageHistory", "usageDaily"} {
+		if err := deleteIfTableExists(db, table); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(`VACUUM`); err != nil {
+		return err
+	}
+	return verifySQLite(dst)
+}
+
+func deleteIfTableExists(db *sql.DB, table string) error {
+	var name string
+	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`DELETE FROM ` + table)
+	return err
 }
 
 func verifySQLite(path string) error {

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/9rtui/9rtui/internal/routerapi"
 	_ "modernc.org/sqlite"
 )
 
@@ -41,6 +42,7 @@ type KiroAccount struct {
 	Remaining    float64        `json:"remainingCredits,omitempty"`
 	Available    bool           `json:"available"`
 	Reason       string         `json:"reason,omitempty"`
+	Raw          map[string]any `json:"-"`
 }
 
 type ImportOptions struct {
@@ -85,6 +87,105 @@ type ImportResult struct {
 	Error      string          `json:"error,omitempty"`
 }
 
+func ManualOAuthProviders(ctx context.Context, base string) []string {
+	providers := []string{}
+	seen := map[string]bool{}
+	if m, err := FetchExistingProviders(ctx, http.DefaultClient, firstNonEmptyString(base, DefaultAPI)); err == nil {
+		for k := range m {
+			p := strings.TrimSpace(strings.TrimPrefix(k, "provider:"))
+			if p == "" || strings.Contains(p, ":") || seen[p] {
+				continue
+			}
+			seen[p] = true
+			providers = append(providers, p)
+		}
+	}
+	for _, p := range []string{"claude-code", "antigravity", "codex", "github-copilot", "cursor", "xai", "kilo-code", "cline", "gemini-cli", "kiro"} {
+		if !seen[p] {
+			seen[p] = true
+			providers = append(providers, p)
+		}
+	}
+	sort.Strings(providers)
+	return providers
+}
+
+func ImportManualRefreshTokens(ctx context.Context, opt ImportOptions, provider, text string) (Result, error) {
+	opt = defaults(opt)
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	rows, err := ParseManualRefreshTokens(provider, text)
+	if err != nil {
+		return Result{}, err
+	}
+	ex, _ := FetchExistingFromDB(opt.DBPath)
+	markAvailability(rows, existingForProvider(ex, provider))
+	res := Result{CreatedAt: opt.Now().Format(time.RFC3339), API: opt.APIBase, Source: "manual", Selected: len(rows), Rows: rows}
+	for _, r := range rows {
+		if r.Available {
+			res.Available++
+		} else {
+			res.Skipped++
+		}
+	}
+	if opt.DryRun || !opt.DoImport {
+		return res, nil
+	}
+	results, err := importViaOfficialBackupAPI(ctx, opt, provider, rows)
+	res.Results = append(res.Results, results...)
+	for _, ir := range results {
+		if ir.Error == "" {
+			res.OK++
+		} else {
+			res.Fail++
+		}
+		if opt.Progress != nil {
+			opt.Progress(ir)
+		}
+	}
+	res.DBCheck = "manual official API import ok"
+	return res, err
+}
+
+func ParseManualRefreshTokens(provider, text string) ([]KiroAccount, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" || provider == "manual" || provider == "all" {
+		return nil, fmt.Errorf("manual import needs one provider")
+	}
+	var rows []KiroAccount
+	for i, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("line %d: want name|refreshtoken", i+1)
+		}
+		name := strings.TrimSpace(parts[0])
+		token := normalizeManualToken(parts[1])
+		if name == "" {
+			return nil, fmt.Errorf("line %d: name required", i+1)
+		}
+		if len(token) < 20 || strings.ContainsAny(token, " \t\r\n") {
+			return nil, fmt.Errorf("line %d: malformed refresh token", i+1)
+		}
+		id := makeID(provider, name+":"+token)
+		rows = append(rows, KiroAccount{ID: id, Provider: provider, AuthType: "oauth", Email: name, Status: "active", RefreshToken: token, Available: true, Data: map[string]any{"refreshToken": token, "authMethod": "manual", "provider": provider}})
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("manual import empty")
+	}
+	return rows, nil
+}
+
+func normalizeManualToken(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "'\"")
+	s = strings.TrimPrefix(s, "refresh_token=")
+	s = strings.TrimPrefix(s, "refreshToken=")
+	return strings.TrimSpace(s)
+}
+
 func RunProvider(ctx context.Context, opt ImportOptions, provider string) (Result, error) {
 	opt = defaults(opt)
 	provider = strings.ToLower(strings.TrimSpace(provider))
@@ -106,6 +207,7 @@ func RunProvider(ctx context.Context, opt ImportOptions, provider string) (Resul
 	if opt.OnlyAvailable {
 		rows = filterAvailable(rows)
 	}
+	SortAccountsByProviderName(rows)
 	if opt.Limit > 0 && opt.Limit < len(rows) {
 		rows = rows[:opt.Limit]
 	}
@@ -120,12 +222,9 @@ func RunProvider(ctx context.Context, opt ImportOptions, provider string) (Resul
 	if opt.DryRun || !opt.DoImport {
 		return res, nil
 	}
-	for _, row := range rows {
-		if !row.Available {
-			continue
-		}
-		ir := upsertOAuthAccount(opt.DBPath, provider, row, opt.Now())
-		res.Results = append(res.Results, ir)
+	results, err := importViaOfficialBackupAPI(ctx, opt, provider, rows)
+	res.Results = append(res.Results, results...)
+	for _, ir := range results {
 		if ir.Error == "" {
 			res.OK++
 		} else {
@@ -135,11 +234,10 @@ func RunProvider(ctx context.Context, opt ImportOptions, provider string) (Resul
 			opt.Progress(ir)
 		}
 	}
-	if status, err := quickCheckPath(opt.DBPath); err != nil {
-		res.DBCheck = "corrupt: " + err.Error()
-	} else {
-		res.DBCheck = status
+	if err != nil {
+		return res, err
 	}
+	res.DBCheck = "official API import ok"
 	logPath, err := writeLog(opt.LogDir, opt.Now(), res)
 	if err != nil {
 		return res, err
@@ -187,12 +285,9 @@ func RunKiro(ctx context.Context, opt ImportOptions) (Result, error) {
 	if opt.DryRun || !opt.DoImport {
 		return res, nil
 	}
-	for _, row := range rows {
-		if !row.Available {
-			continue
-		}
-		ir := upsertOAuthAccount(opt.DBPath, "kiro", row, opt.Now())
-		res.Results = append(res.Results, ir)
+	results, err := importViaOfficialBackupAPI(ctx, opt, "kiro", rows)
+	res.Results = append(res.Results, results...)
+	for _, ir := range results {
 		if ir.Error == "" {
 			res.OK++
 		} else {
@@ -202,6 +297,10 @@ func RunKiro(ctx context.Context, opt ImportOptions) (Result, error) {
 			opt.Progress(ir)
 		}
 	}
+	if err != nil {
+		return res, err
+	}
+	res.DBCheck = "official API import ok"
 	logPath, err := writeLog(opt.LogDir, opt.Now(), res)
 	if err != nil {
 		return res, err
@@ -537,7 +636,7 @@ func rootArray(root any) []any {
 	}
 	if m, ok := root.(map[string]any); ok {
 		// Try multiple root array keys
-		for _, key := range []string{"data", "accounts", "rows"} {
+		for _, key := range []string{"providerConnections", "accounts", "rows", "data"} {
 			if a, ok := m[key].([]any); ok {
 				return a
 			}
@@ -642,9 +741,12 @@ func collectProviders(v any, out map[string]bool) {
 			collectProviders(e, out)
 		}
 	case map[string]any:
-		if strings.ToLower(str(x["provider"])) == "kiro" {
-			if email := strings.ToLower(strings.TrimSpace(str(x["email"]))); email != "" {
-				out["email:"+email] = true
+		if p := strings.ToLower(strings.TrimSpace(str(x["provider"]))); p != "" {
+			out["provider:"+p] = true
+			if p == "kiro" {
+				if email := strings.ToLower(strings.TrimSpace(str(x["email"]))); email != "" {
+					out["email:"+email] = true
+				}
 			}
 		}
 		for _, e := range x {
@@ -686,6 +788,7 @@ func LoadProviderAccounts(path, provider string) ([]KiroAccount, error) {
 		}
 	}
 	out := make([]KiroAccount, 0, len(arr))
+	allProviders := provider == "all"
 	for i, v := range arr {
 		m, ok := v.(map[string]any)
 		if !ok {
@@ -695,16 +798,33 @@ func LoadProviderAccounts(path, provider string) ([]KiroAccount, error) {
 		if rowProvider == "" {
 			rowProvider = provider
 		}
-		if rowProvider != provider {
+		if !allProviders && rowProvider != provider {
 			continue
 		}
-		row := normalizeProviderRow(m, provider, i+1)
+		row := normalizeProviderRow(m, rowProvider, i+1)
 		if row.RefreshToken == "" && row.AccessToken == "" {
 			continue
 		}
 		out = append(out, row)
 	}
+	SortAccountsByProviderName(out)
 	return out, nil
+}
+
+func SortAccountsByProviderName(rows []KiroAccount) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		pi := strings.ToLower(strings.TrimSpace(rows[i].Provider))
+		pj := strings.ToLower(strings.TrimSpace(rows[j].Provider))
+		if pi != pj {
+			return pi < pj
+		}
+		ni := strings.ToLower(firstNonEmptyString(rows[i].Email, rows[i].ID))
+		nj := strings.ToLower(firstNonEmptyString(rows[j].Email, rows[j].ID))
+		if ni != nj {
+			return ni < nj
+		}
+		return rows[i].ID < rows[j].ID
+	})
 }
 
 func loadProviderText(s, provider string) []KiroAccount {
@@ -766,7 +886,7 @@ func normalizeProviderRow(m map[string]any, provider string, n int) KiroAccount 
 		planType = firstDeep(data, "planType", "chatgptPlanType")
 	}
 	email := firstNonEmptyString(str(m["email"]), str(m["name"]), str(m["id"]), fmt.Sprintf("%s Account %d", importLabel(provider), n))
-	row := KiroAccount{ID: firstNonEmptyString(str(m["id"]), makeID(provider, rt+at)), Provider: provider, AuthType: firstNonEmptyString(str(m["authType"]), "oauth"), Email: email, Status: status, RefreshToken: rt, AccessToken: at, RefreshHash: tokenHash(rt), AccessHash: tokenHash(at), ExpiresAt: expiresAt, PlanType: planType}
+	row := KiroAccount{ID: firstNonEmptyString(str(m["id"]), makeID(provider, rt+at)), Provider: firstNonEmptyString(str(m["provider"]), provider), AuthType: firstNonEmptyString(str(m["authType"]), "oauth"), Email: email, Status: status, RefreshToken: rt, AccessToken: at, RefreshHash: tokenHash(rt), AccessHash: tokenHash(at), ExpiresAt: expiresAt, PlanType: planType, Raw: cloneMap(m)}
 	if data == nil {
 		data = map[string]any{}
 	}
@@ -788,9 +908,31 @@ func normalizeProviderRow(m map[string]any, provider string, n int) KiroAccount 
 	return row
 }
 
+func cloneMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	bb, err := json.Marshal(m)
+	if err != nil {
+		out := map[string]any{}
+		for k, v := range m {
+			out[k] = v
+		}
+		return out
+	}
+	var out map[string]any
+	if err := json.Unmarshal(bb, &out); err != nil {
+		out = map[string]any{}
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 func dataObject(v any) map[string]any {
 	if m, ok := v.(map[string]any); ok {
-		return m
+		return cloneMap(m)
 	}
 	if s := str(v); s != "" {
 		var m map[string]any
@@ -845,6 +987,92 @@ func oauthData(row KiroAccount) map[string]any {
 		m["expiresAt"] = "1970-01-01T00:00:00Z"
 	}
 	return m
+}
+
+func importViaOfficialBackupAPI(ctx context.Context, opt ImportOptions, provider string, rows []KiroAccount) ([]ImportResult, error) {
+	client, err := routerapi.New(firstNonEmptyString(opt.APIBase, DefaultAPI))
+	if err != nil {
+		return nil, err
+	}
+	backup, err := client.ExportDatabase(ctx)
+	if err != nil {
+		return nil, err
+	}
+	conns := routerapi.ProviderConnections(backup)
+	idx := map[string]int{}
+	for i, c := range conns {
+		idx[routerapi.AccountID(c)] = i
+	}
+	results := make([]ImportResult, 0, len(rows))
+	now := opt.Now().Format(time.RFC3339)
+	for _, row := range rows {
+		if !row.Available {
+			continue
+		}
+		rowProvider := firstNonEmptyString(row.Provider, provider)
+		if rowProvider == "all" {
+			rowProvider = ""
+		}
+		id := row.ID
+		if id == "" {
+			id = makeID(rowProvider, row.RefreshToken+row.AccessToken)
+		}
+		var m map[string]any
+		if row.Raw != nil {
+			m = cloneMap(row.Raw)
+		} else {
+			data := row.Data
+			if data == nil {
+				data = oauthData(row)
+			}
+			m = map[string]any{}
+			for k, v := range data {
+				m[k] = v
+			}
+			m["authType"] = firstNonEmptyString(row.AuthType, "oauth")
+			m["name"] = row.Email
+			m["email"] = row.Email
+			m["priority"] = 0
+			m["isActive"] = true
+		}
+		m["id"] = id
+		m["provider"] = rowProvider
+		if _, ok := m["authType"]; !ok {
+			m["authType"] = firstNonEmptyString(row.AuthType, "oauth")
+		}
+		if _, ok := m["name"]; !ok {
+			m["name"] = row.Email
+		}
+		if _, ok := m["email"]; !ok {
+			m["email"] = row.Email
+		}
+		if _, ok := m["priority"]; !ok {
+			m["priority"] = 0
+		}
+		if _, ok := m["isActive"]; !ok {
+			m["isActive"] = true
+		}
+		if oldIdx, ok := idx[id]; ok {
+			if s, _ := conns[oldIdx]["createdAt"].(string); s != "" {
+				m["createdAt"] = s
+			} else {
+				m["createdAt"] = now
+			}
+			m["updatedAt"] = now
+			conns[oldIdx] = m
+		} else {
+			m["createdAt"] = now
+			m["updatedAt"] = now
+			conns = append(conns, m)
+			idx[id] = len(conns) - 1
+		}
+		results = append(results, ImportResult{Email: row.Email, SourceID: id, HTTPStatus: 200})
+	}
+	routerapi.SetProviderConnections(backup, conns)
+	if err := client.ImportDatabase(ctx, backup); err != nil {
+		return results, err
+	}
+	return results, nil
 }
 
 func upsertOAuthAccount(dbPath, provider string, row KiroAccount, now time.Time) ImportResult {

@@ -31,14 +31,18 @@ const (
 	help
 	inspect
 	importProvider
+	manualImport
 	importFilePicker
 	importScreen
 	confirmImport
 	confirmVacuum
+	confirmIndex
+	optionsMenu
 	confirmRestore
 	exportDone
 	updatePage
 	confirmUpdate
+	apiKeysPage
 )
 
 type importProviderOption struct {
@@ -117,9 +121,20 @@ type Model struct {
 	importErr          int
 	importDBCheck      string
 	importLabel        string
+	manualProviderCur  int
+	manualField        int
+	manualName         string
+	manualText         string
+	manualCursor       int
+	manualScrollX      int
+	manualScrollY      int
+	manualMsg          string
 	vacuumRunning      bool
 	vacuumMsg          string
 	vacuum9RRunning    bool
+	optionCursor       int
+	autoBackupMethod   repo.BackupCopyMethod
+	snapBackupMethod   repo.BackupCopyMethod
 	// preview state for restore (backups mode) right pane
 	restorePreviewPath   string
 	restorePreviewText   string
@@ -143,6 +158,15 @@ type Model struct {
 	updateTotal     int64
 	updateStatus    string
 	updateErr       string
+	apiKeys         []repo.APIKey
+	apiKeyCursor    int
+	apiKeyMsg       string
+	apiKeyForm      bool
+	apiKeyFormEdit  bool
+	apiKeyFormField int
+	apiKeyFormID    string
+	apiKeyFormName  string
+	apiKeyFormKey   string
 }
 
 type updateRelease struct {
@@ -204,11 +228,17 @@ func importTick() tea.Cmd {
 }
 
 func New(dbPath, version, commit, buildDate string) Model {
-	m := Model{r: repo.New(dbPath), selected: map[string]bool{}, importSelected: map[string]bool{}, focusLeft: true, stateFilter: "off", sortField: "name", importFilter: "all", importSort: "email", importProvider: "kiro", version: version, commit: commit, buildDate: buildDate}
+	autoMethod, _ := repo.ParseBackupCopyMethod(os.Getenv("NRTUI_AUTO_BACKUP_METHOD"))
+	snapMethod, _ := repo.ParseBackupCopyMethod(os.Getenv("NRTUI_SNAP_BACKUP_METHOD"))
+	m := Model{r: repo.New(dbPath), selected: map[string]bool{}, importSelected: map[string]bool{}, focusLeft: true, stateFilter: "off", sortField: "name", importFilter: "all", importSort: "email", importProvider: "kiro", version: version, commit: commit, buildDate: buildDate, autoBackupMethod: autoMethod, snapBackupMethod: snapMethod}
 	m.refresh()
 	return m
 }
 func (m *Model) refresh() {
+	autoMsg := ""
+	if p, err := m.r.EnsureDailyBackupWithMethod(m.autoBackupMethod); err == nil && p != "" {
+		autoMsg = " | autobackup: " + filepath.Base(p)
+	}
 	a, err := m.r.ListAccounts()
 	if err != nil {
 		m.msg = err.Error()
@@ -223,9 +253,33 @@ func (m *Model) refresh() {
 	if m.cursor >= len(m.visible()) {
 		m.cursor = max(0, len(m.visible())-1)
 	}
-	m.msg = fmt.Sprintf("loaded %d accounts", len(a))
+	m.msg = fmt.Sprintf("loaded %d accounts", len(a)) + autoMsg
 }
 func (m Model) Init() tea.Cmd { return nil }
+
+func (m Model) saveBackupMethods() {
+	path := strings.TrimSpace(os.Getenv("NRTUI_CONFIG_PATH"))
+	if path == "" {
+		return
+	}
+	b, _ := os.ReadFile(path)
+	lines := strings.Split(string(b), "\n")
+	set := func(key, val string) {
+		found := false
+		for i, line := range lines {
+			if strings.HasPrefix(strings.TrimSpace(line), key+" =") || strings.HasPrefix(strings.TrimSpace(line), key+"=") {
+				lines[i] = key + " = " + val
+				found = true
+			}
+		}
+		if !found {
+			lines = append(lines, key+" = "+val)
+		}
+	}
+	set("auto_backup_method", string(m.autoBackupMethod))
+	set("snap_backup_method", string(m.snapBackupMethod))
+	_ = os.WriteFile(path, []byte(strings.TrimRight(strings.Join(lines, "\n"), "\n")+"\n"), 0600)
+}
 func (m Model) visible() []domain.Account {
 	gp := "all"
 	if len(m.providers) > 0 {
@@ -318,10 +372,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.msg = x.label + " failed: " + x.err.Error()
 			return m, nil
 		}
-		m.msg = x.label + " done; reloading import table"
+		m.msg = x.label + " done"
 		m.refresh()
 		m.importSelected = map[string]bool{}
 		m.importVisual = false
+		if strings.HasPrefix(x.label, "manual ") {
+			m.manualText = ""
+			m.manualMsg = x.label + " done"
+			m.mode = manualImport
+			return m, nil
+		}
+		m.msg += "; reloading import table"
 		return m.openImportScreen()
 	case importProgressMsg:
 		importProg.Lock()
@@ -498,10 +559,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				ui, _ := m.r.UndoLogs()
 				m.undoInfos = ui
 			}
-			if k == "C" {
-				m.vacuum9RRunning = is9RouterRunning()
-				m.vacuumMsg = ""
-				m.mode = confirmVacuum
+			if k == "/" {
+				m.optionCursor = 0
+				m.mode = optionsMenu
+				return m, nil
 			}
 			if k == "I" || k == "i" {
 				return m.openImportProvider()
@@ -511,8 +572,61 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.loadRestorePreviewCmd()
 			}
 			return m, nil
+		case optionsMenu:
+			if k == "esc" || k == "q" || k == "/" {
+				m.mode = normal
+				return m, nil
+			}
+			if k == "j" || k == "down" {
+				m.optionCursor = min(9, m.optionCursor+1)
+				return m, nil
+			}
+			if k == "k" || k == "up" {
+				m.optionCursor = max(0, m.optionCursor-1)
+				return m, nil
+			}
+			if k == "enter" || k == " " {
+				m.vacuum9RRunning = is9RouterRunning()
+				m.vacuumMsg = ""
+				switch m.optionCursor {
+				case 0:
+					m.mode = confirmVacuum
+				case 1:
+					m.mode = confirmIndex
+				case 2:
+					m.vacuumRunning = true
+					m.vacuumMsg = "autobacking up..."
+					return m, m.autoBackupCmd()
+				case 3:
+					m.autoBackupMethod = repo.BackupCopyNone
+					m.saveBackupMethods()
+				case 4:
+					m.autoBackupMethod = repo.BackupCopyVacuum
+					m.saveBackupMethods()
+				case 5:
+					m.autoBackupMethod = repo.BackupCopyVacuumCleanup
+					m.saveBackupMethods()
+				case 6:
+					m.vacuumRunning = true
+					m.vacuumMsg = "snapshotting..."
+					return m, m.snapshotCmd()
+				case 7:
+					m.snapBackupMethod = repo.BackupCopyNone
+					m.saveBackupMethods()
+				case 8:
+					m.snapBackupMethod = repo.BackupCopyVacuum
+					m.saveBackupMethods()
+				case 9:
+					m.snapBackupMethod = repo.BackupCopyVacuumCleanup
+					m.saveBackupMethods()
+				}
+				return m, nil
+			}
+			return m, nil
 		case importProvider:
 			return m.updateImportProvider(k)
+		case manualImport:
+			return m.updateManualImport(k)
 		case importFilePicker:
 			return m.updateImportFilePicker(k)
 		case importScreen:
@@ -576,16 +690,81 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+		case confirmIndex:
+			if k == "esc" || k == "n" {
+				m.mode = optionsMenu
+				return m, nil
+			}
+			if (k == "enter" || k == "y") && !m.vacuumRunning {
+				m.vacuumRunning = true
+				m.vacuumMsg = "indexing..."
+				m.mode = optionsMenu
+				return m, m.indexCmd()
+			}
+			return m, nil
 		case confirmVacuum:
 			if k == "esc" || k == "n" {
-				m.mode = backups
+				m.mode = optionsMenu
 				return m, nil
 			}
 			if (k == "enter" || k == "y") && !m.vacuumRunning {
 				m.vacuumRunning = true
 				m.vacuumMsg = "vacuuming..."
-				m.mode = backups
+				m.mode = optionsMenu
 				return m, m.vacuumCmd()
+			}
+			return m, nil
+		case apiKeysPage:
+			if m.apiKeyForm {
+				return m.updateAPIKeyForm(k)
+			}
+			if k == "esc" || k == "q" || k == "K" {
+				m.mode = normal
+				return m, nil
+			}
+			if k == "j" || k == "down" {
+				m.apiKeyCursor = min(len(m.apiKeys)-1, m.apiKeyCursor+1)
+			}
+			if k == "k" || k == "up" {
+				m.apiKeyCursor = max(0, m.apiKeyCursor-1)
+			}
+			if k == "r" {
+				return m.openAPIKeysPage()
+			}
+			if k == "n" || k == "N" {
+				m.apiKeyForm = true
+				m.apiKeyFormEdit = false
+				m.apiKeyFormField = 0
+				m.apiKeyFormID = ""
+				m.apiKeyFormName = ""
+				m.apiKeyFormKey = ""
+				m.apiKeyMsg = "create api key"
+				return m, nil
+			}
+			if (k == "e" || k == "E" || k == "enter") && len(m.apiKeys) > 0 {
+				cur := m.apiKeys[m.apiKeyCursor]
+				m.apiKeyForm = true
+				m.apiKeyFormEdit = true
+				m.apiKeyFormField = 0
+				m.apiKeyFormID = cur.ID
+				m.apiKeyFormName = cur.Name
+				m.apiKeyFormKey = cur.Key
+				m.apiKeyMsg = "edit api key"
+				return m, nil
+			}
+			if (k == "t" || k == "T") && len(m.apiKeys) > 0 {
+				if err := m.r.ToggleAPIKey(m.apiKeys[m.apiKeyCursor].ID); err != nil {
+					m.apiKeyMsg = err.Error()
+					return m, nil
+				}
+				return m.openAPIKeysPage()
+			}
+			if (k == "x" || k == "X") && len(m.apiKeys) > 0 {
+				if err := m.r.DeleteAPIKey(m.apiKeys[m.apiKeyCursor].ID); err != nil {
+					m.apiKeyMsg = err.Error()
+					return m, nil
+				}
+				return m.openAPIKeysPage()
 			}
 			return m, nil
 		case help:
@@ -648,11 +827,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		switch k {
+		case "K":
+			return m.openAPIKeysPage()
 		case "U", "u":
 			if len(m.updateReleases) == 0 {
 				m.updateReleases = m.defaultUpdateReleases()
 			}
 			m.mode = updatePage
+			return m, nil
+		case "/":
+			m.optionCursor = 0
+			m.mode = optionsMenu
 			return m, nil
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -1077,6 +1262,9 @@ func (m Model) View() string {
 		body = overlayPopup(m.w, m.h, bg, popup)
 	case backups:
 		body = m.backupView()
+	case optionsMenu:
+		bg := m.mainView()
+		body = overlayPopup(m.w, m.h, bg, m.optionsView())
 	case inspect:
 		body = m.inspectView()
 	case exportDone:
@@ -1085,12 +1273,20 @@ func (m Model) View() string {
 		body = overlayPopup(m.w, m.h, bg, popup)
 	case updatePage:
 		body = m.updateView()
+	case apiKeysPage:
+		body = m.apiKeysView()
 	case confirmUpdate:
 		bg := lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, m.updateView())
 		popup := m.confirmUpdateView()
 		body = overlayPopup(m.w, m.h, bg, popup)
 	case importProvider:
 		body = m.importProviderView()
+	case manualImport:
+		bg := lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, m.importProviderView())
+		body = overlayPopup(m.w, m.h, bg, m.manualImportView())
+		if m.manualField == 1 {
+			body = overlayPopup(m.w, m.h, body, m.manualProviderPopupView())
+		}
 	case importFilePicker:
 		body = m.importFilePickerView()
 	case importScreen:
@@ -1100,8 +1296,12 @@ func (m Model) View() string {
 		popup := m.confirmImportView()
 		body = overlayPopup(m.w, m.h, bg, popup)
 	case confirmVacuum:
-		bg := lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, m.backupView())
+		bg := lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, m.optionsView())
 		popup := m.vacuumConfirmView()
+		body = overlayPopup(m.w, m.h, bg, popup)
+	case confirmIndex:
+		bg := lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, m.optionsView())
+		popup := m.indexConfirmView()
 		body = overlayPopup(m.w, m.h, bg, popup)
 	case confirmRestore:
 		bg := lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, m.backupView())
@@ -1252,7 +1452,6 @@ func (m Model) headerView(visible int) string {
 }
 
 func (m Model) footerView() string {
-	keys := " h/l pane  j/k move  gg/G jump  Enter/i inspect  I import  Space select  v visual  O on/off  f filter  s/S sort  d delete  b recovery  U updates  r refresh  ? help  q quit "
 	v := m.version
 	if v == "" || v == "dev" {
 		v = "v0.1-dev"
@@ -1264,11 +1463,13 @@ func (m Model) footerView() string {
 	badge := badgeStyle.Render(v)
 	hint := ""
 	if m.updateAvailable {
-		hint = muted.Render("  PRESS U TO UPDATE")
+		hint = muted.Render(" | PRESS U TO UPDATE")
 	}
-	left := lipgloss.JoinHorizontal(lipgloss.Center, badge, hint)
-	line := left + "  " + keys
-	return footer.Width(max(0, m.w-2)).Render(clipLine(line, max(0, m.w-2)))
+	line1 := lipgloss.JoinHorizontal(lipgloss.Center, badge, hint, muted.Render(" | / options | ? help | q quit"))
+	line2 := "h/l pane | j/k move | gg/G jump | Enter/i inspect | I import | Space select | v visual | O on/off"
+	line3 := "f filter | s/S sort | d delete | b recovery | U update center | r refresh"
+	w := max(0, m.w-2)
+	return footer.Width(w).Render(strings.Join([]string{clipLine(line1, w), clipLine(line2, w), clipLine(line3, w)}, "\n"))
 }
 
 func (m Model) defaultUpdateReleases() []updateRelease {
@@ -1278,13 +1479,14 @@ func (m Model) defaultUpdateReleases() []updateRelease {
 		state := "older"
 		if tag == current {
 			state = "current"
-		} else if tag == "v0.1.1-beta" && current != "v0.1.1-beta" {
+		} else if tag == "v0.2.0-beta.1" && current != "v0.2.0-beta.1" {
 			state = "newer"
 		}
 		return updateRelease{Tag: tag, Kind: kind, State: state, URL: "https://github.com/achrllrogia45/9rtui/releases/download/" + tag + "/" + asset, Asset: asset, Summary: summary}
 	}
 	return []updateRelease{
-		mk("v0.1.1-beta", "beta", "new beta, idk still beta lmao"),
+		mk("v0.2.0-beta.1", "beta", "official backup API beta"),
+		mk("v0.1.1-beta", "beta", "previous beta"),
 		mk("v0.1beta", "beta", "old beta fallback / downgrade"),
 	}
 }
@@ -1303,6 +1505,125 @@ func firstNonEmptyString(xs ...string) string {
 		}
 	}
 	return ""
+}
+
+func (m Model) openAPIKeysPage() (tea.Model, tea.Cmd) {
+	keys, err := m.r.ListAPIKeys()
+	if err != nil {
+		m.apiKeyMsg = err.Error()
+	} else {
+		m.apiKeys = keys
+		m.apiKeyMsg = fmt.Sprintf("loaded %d api keys", len(keys))
+	}
+	m.apiKeyCursor = 0
+	m.mode = apiKeysPage
+	return m, nil
+}
+
+func (m Model) updateAPIKeyForm(k string) (tea.Model, tea.Cmd) {
+	if k == "esc" || k == "ctrl+c" {
+		m.apiKeyForm = false
+		return m, nil
+	}
+	if k == "tab" || k == "down" {
+		m.apiKeyFormField = (m.apiKeyFormField + 1) % 2
+		return m, nil
+	}
+	if k == "shift+tab" || k == "up" {
+		m.apiKeyFormField = (m.apiKeyFormField + 1) % 2
+		return m, nil
+	}
+	if k == "enter" {
+		if m.apiKeyFormEdit {
+			if err := m.r.UpdateAPIKey(m.apiKeyFormID, m.apiKeyFormName, m.apiKeyFormKey); err != nil {
+				m.apiKeyMsg = err.Error()
+				return m, nil
+			}
+		} else {
+			if _, err := m.r.CreateAPIKey(m.apiKeyFormName, m.apiKeyFormKey); err != nil {
+				m.apiKeyMsg = err.Error()
+				return m, nil
+			}
+		}
+		m.apiKeyForm = false
+		return m.openAPIKeysPage()
+	}
+	if k == "backspace" || k == "ctrl+h" {
+		if m.apiKeyFormField == 0 && len(m.apiKeyFormName) > 0 {
+			m.apiKeyFormName = m.apiKeyFormName[:len(m.apiKeyFormName)-1]
+		} else if m.apiKeyFormField == 1 && len(m.apiKeyFormKey) > 0 {
+			m.apiKeyFormKey = m.apiKeyFormKey[:len(m.apiKeyFormKey)-1]
+		}
+		return m, nil
+	}
+	if len(k) == 1 && k >= " " && k <= "~" {
+		if m.apiKeyFormField == 0 {
+			m.apiKeyFormName += k
+		} else {
+			m.apiKeyFormKey += k
+		}
+	}
+	return m, nil
+}
+
+func (m Model) apiKeysView() string {
+	w := max(80, m.w-4)
+	title := brand.Render(" API Keys ")
+	lines := []string{title, muted.Render("K/q/Esc back | n create | enter/e edit | t toggle | x delete | r refresh"), ""}
+	if m.apiKeyForm {
+		mode := "Create API Key"
+		if m.apiKeyFormEdit {
+			mode = "Edit API Key"
+		}
+		namePrefix, keyPrefix := "  ", "  "
+		if m.apiKeyFormField == 0 {
+			namePrefix = "▶ "
+		} else {
+			keyPrefix = "▶ "
+		}
+		keyHint := "blank = auto sk-key"
+		if m.apiKeyFormEdit {
+			keyHint = "edit key directly"
+		}
+		lines = append(lines,
+			brand.Render(" "+mode+" "),
+			muted.Render("Tab switch field | Enter save | Esc cancel"),
+			"",
+			namePrefix+"Name: "+m.apiKeyFormName,
+			keyPrefix+"Key:  "+m.apiKeyFormKey+"  "+muted.Render("("+keyHint+")"),
+		)
+		box := focusPane.Width(w).Render(strings.Join(lines, "\n"))
+		return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Top, box)
+	}
+	if m.apiKeyMsg != "" {
+		lines = append(lines, m.apiKeyMsg, "")
+	}
+	if len(m.apiKeys) == 0 {
+		lines = append(lines, muted.Render("no api keys found"))
+	} else {
+		lines = append(lines, fmt.Sprintf("%-3s %-22s %-18s %-8s %s", "", "name", "key", "active", "created"))
+		for i, k := range m.apiKeys {
+			cur := "  "
+			if i == m.apiKeyCursor {
+				cur = "▶ "
+			}
+			active := "off"
+			if k.IsActive {
+				active = "on"
+			}
+			name := k.Name
+			if name == "" {
+				name = "(unnamed)"
+			}
+			row := fmt.Sprintf("%s%-22s %-18s %-8s %s", cur, ansi.Truncate(name, 22, "…"), repo.MaskKey(k.Key), active, k.CreatedAt)
+			if i == m.apiKeyCursor {
+				row = selectedChip.Render(row)
+			}
+			lines = append(lines, row)
+		}
+	}
+	box := focusPane.Width(w).Render(strings.Join(lines, "\n"))
+	return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Top, box)
 }
 
 func (m Model) updateView() string {
@@ -1386,18 +1707,45 @@ func (m Model) importCmd(label string, ids []string, limit int, doImport bool) t
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
-		res, err := importer.RunProvider(ctx, importer.ImportOptions{AccountsPath: m.importAccountsPath, DBPath: m.r.Path, DoImport: doImport, DryRun: !doImport, ActiveOnly: false, IncludeInactive: true, OnlyAvailable: false, IDs: ids, Limit: limit, Parallel: 5, Progress: func(ir importer.ImportResult) {
-			importProg.Lock()
-			importProg.done++
-			if ir.HTTPStatus == 0 && ir.Error != "" {
-				importProg.errs++
-			} else if ir.HTTPStatus >= 200 && ir.HTTPStatus < 300 && ir.Error == "" {
-				importProg.ok++
-			} else {
-				importProg.fail++
+		runOne := func(provider string) (importer.Result, error) {
+			return importer.RunProvider(ctx, importer.ImportOptions{AccountsPath: m.importAccountsPath, DBPath: m.r.Path, DoImport: doImport, DryRun: !doImport, ActiveOnly: false, IncludeInactive: true, OnlyAvailable: false, IDs: ids, Limit: limit, Parallel: 5, Progress: func(ir importer.ImportResult) {
+				importProg.Lock()
+				importProg.done++
+				if ir.HTTPStatus == 0 && ir.Error != "" {
+					importProg.errs++
+				} else if ir.HTTPStatus >= 200 && ir.HTTPStatus < 300 && ir.Error == "" {
+					importProg.ok++
+				} else {
+					importProg.fail++
+				}
+				importProg.Unlock()
+			}}, provider)
+		}
+		var res importer.Result
+		var err error
+		if m.importProvider == "all" {
+			parts := []string{}
+			for _, p := range importProviderOptions() {
+				if p.ID == "all" || !p.Ready {
+					continue
+				}
+				r, e := runOne(p.ID)
+				res.OK += r.OK
+				res.Fail += r.Fail
+				res.Available += r.Available
+				res.Skipped += r.Skipped
+				res.Selected += r.Selected
+				if e != nil {
+					err = e
+					parts = append(parts, p.ID+": "+e.Error())
+				} else {
+					parts = append(parts, p.ID+": "+importer.Summary(r))
+				}
 			}
-			importProg.Unlock()
-		}}, m.importProvider)
+			res.DBCheck = strings.Join(parts, " | ")
+		} else {
+			res, err = runOne(m.importProvider)
+		}
 		importProg.Lock()
 		importProg.running = false
 		okN, failN, errN := importProg.ok, importProg.fail, importProg.errs
@@ -1416,6 +1764,20 @@ func (m Model) openImportScreen() (tea.Model, tea.Cmd) {
 	return m, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		if m.importProvider == "all" {
+			var rows []importer.KiroAccount
+			for _, p := range importProviderOptions() {
+				if p.ID == "all" || !p.Ready {
+					continue
+				}
+				res, err := importer.RunProvider(ctx, importer.ImportOptions{AccountsPath: m.importAccountsPath, DBPath: m.r.Path, DryRun: true, ActiveOnly: false, IncludeInactive: true}, p.ID)
+				if err != nil {
+					continue
+				}
+				rows = append(rows, res.Rows...)
+			}
+			return importRowsMsg{rows: rows}
+		}
 		res, err := importer.RunProvider(ctx, importer.ImportOptions{AccountsPath: m.importAccountsPath, DBPath: m.r.Path, DryRun: true, ActiveOnly: false, IncludeInactive: true}, m.importProvider)
 		if err != nil {
 			return importRowsMsg{err: err}
@@ -1548,21 +1910,45 @@ func (m Model) updateImportProvider(k string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.importProvider = p.ID
+		if p.ID == "manual" {
+			m.manualName = ""
+			m.manualText = ""
+			m.manualMsg = ""
+			m.manualField = 0
+			m.manualProviderCur = 0
+			m.mode = manualImport
+			return m, nil
+		}
 		return m.openImportFilePicker()
 	}
 	return m, nil
 }
 
 func importProviderOptions() []importProviderOption {
-	return []importProviderOption{
-		{ID: "kiro", Label: "Kiro", Description: "official Kiro import via API", Source: "", Ready: true},
-		{ID: "codex", Label: "OpenAI Codex", Description: "dev DB direct import", Source: "", Ready: true},
-		{ID: "antigravity", Label: "Anti Gravity", Description: "dev DB direct import", Source: "", Ready: true},
+	out := []importProviderOption{{ID: "manual", Label: "Manual input", Description: "paste tokens", Source: "dynamic OAuth", Ready: true}, {ID: "all", Label: "All", Description: "all accounts, grouped by provider", Source: "", Ready: true}}
+	base := strings.TrimSpace(os.Getenv("NRTUI_API"))
+	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+	providers := importer.ManualOAuthProviders(ctx, base)
+	cancel()
+	seen := map[string]bool{"manual": true, "all": true}
+	for _, p := range []string{"kiro", "codex", "antigravity"} {
+		seen[p] = true
+		out = append(out, importProviderOption{ID: p, Label: importProviderLabel(p), Description: "account file import", Source: "built-in", Ready: true})
 	}
+	for _, p := range providers {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, importProviderOption{ID: p, Label: importProviderLabel(p), Description: "provider JSON import", Source: "9Router OAuth", Ready: true})
+	}
+	return out
 }
 
 func importProviderLabel(id string) string {
 	switch id {
+	case "all":
+		return "All"
 	case "kiro", "":
 		return "Kiro"
 	case "codex":
@@ -1577,6 +1963,142 @@ func importProviderLabel(id string) string {
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+func manualProviderIDs() []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+	defer cancel()
+	return importer.ManualOAuthProviders(ctx, strings.TrimSpace(os.Getenv("NRTUI_API")))
+}
+
+func (m Model) updateManualImport(k string) (tea.Model, tea.Cmd) {
+	ps := manualProviderIDs()
+	if len(ps) == 0 {
+		ps = []string{"kiro"}
+	}
+	if m.manualProviderCur >= len(ps) {
+		m.manualProviderCur = 0
+	}
+	m.manualCursor = clamp(m.manualCursor, 0, len(m.manualText))
+	switch k {
+	case "esc", "q":
+		m.mode = importProvider
+		return m, nil
+	case "tab":
+		m.manualField = (m.manualField + 1) % 3
+		return m, nil
+	case "shift+tab":
+		m.manualField = (m.manualField + 2) % 3
+		return m, nil
+	case "enter", "ctrl+s":
+		if m.manualField == 1 {
+			m.manualField = 2
+			return m, nil
+		}
+		provider := ps[m.manualProviderCur]
+		text := strings.TrimSpace(m.manualText)
+		m.importRunning = true
+		m.importLabel = "MANUAL " + provider
+		m.importTotal = len(strings.Split(text, "\n"))
+		return m, m.manualImportCmd(provider, text)
+	case "ctrl+l":
+		m.manualName = ""
+		m.manualText = ""
+		m.manualCursor = 0
+		m.manualScrollX = 0
+		m.manualScrollY = 0
+		m.manualMsg = "cleared"
+		return m, nil
+	}
+	if m.manualField == 1 {
+		switch k {
+		case "up", "k":
+			m.manualProviderCur = max(0, m.manualProviderCur-1)
+		case "down", "j":
+			m.manualProviderCur = min(len(ps)-1, m.manualProviderCur+1)
+		}
+		return m, nil
+	}
+	if m.manualField == 2 {
+		switch k {
+		case "left", "ctrl+b":
+			m.manualCursor = max(0, m.manualCursor-1)
+		case "right", "ctrl+f":
+			m.manualCursor = min(len(m.manualText), m.manualCursor+1)
+		case "home", "ctrl+a":
+			m.manualCursor = manualLineStart(m.manualText, m.manualCursor)
+			m.manualScrollX = 0
+		case "end", "ctrl+e":
+			m.manualCursor = manualLineEnd(m.manualText, m.manualCursor)
+			m.manualScrollX = 9999
+		case "up":
+			m.manualCursor = manualMoveLine(m.manualText, m.manualCursor, -1)
+		case "down":
+			m.manualCursor = manualMoveLine(m.manualText, m.manualCursor, 1)
+		case "backspace", "ctrl+h":
+			if m.manualCursor > 0 {
+				m.manualText = m.manualText[:m.manualCursor-1] + m.manualText[m.manualCursor:]
+				m.manualCursor--
+			}
+		case "ctrl+j":
+			m.manualText = m.manualText[:m.manualCursor] + "\n" + m.manualText[m.manualCursor:]
+			m.manualCursor++
+		default:
+			if strings.TrimSpace(k) != "" && !strings.Contains(k, "ctrl+") && !strings.Contains(k, "alt+") {
+				m.manualText = m.manualText[:m.manualCursor] + k + m.manualText[m.manualCursor:]
+				m.manualCursor += len(k)
+			}
+		}
+	}
+	return m, nil
+}
+
+func manualLineStart(s string, pos int) int {
+	pos = clamp(pos, 0, len(s))
+	if i := strings.LastIndex(s[:pos], "\n"); i >= 0 {
+		return i + 1
+	}
+	return 0
+}
+
+func manualLineEnd(s string, pos int) int {
+	pos = clamp(pos, 0, len(s))
+	if i := strings.Index(s[pos:], "\n"); i >= 0 {
+		return pos + i
+	}
+	return len(s)
+}
+
+func manualMoveLine(s string, pos, delta int) int {
+	start := manualLineStart(s, pos)
+	col := pos - start
+	if delta < 0 {
+		if start == 0 {
+			return pos
+		}
+		prevEnd := start - 1
+		prevStart := manualLineStart(s, prevEnd)
+		return min(prevStart+col, prevEnd)
+	}
+	end := manualLineEnd(s, pos)
+	if end >= len(s) {
+		return pos
+	}
+	nextStart := end + 1
+	nextEnd := manualLineEnd(s, nextStart)
+	return min(nextStart+col, nextEnd)
+}
+
+func (m Model) manualImportCmd(provider, text string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		res, err := importer.ImportManualRefreshTokens(ctx, importer.ImportOptions{DBPath: m.r.Path, DoImport: true, DryRun: false, Parallel: 5}, provider, text)
+		if err != nil {
+			return importDoneMsg{label: "manual " + provider, db: res.DBCheck, err: err}
+		}
+		return importDoneMsg{label: "manual " + provider + " " + importer.Summary(res), ok: res.OK, fail: res.Fail, errs: 0, db: res.DBCheck}
+	}
 }
 
 func (m Model) importVisible() []importer.KiroAccount {
@@ -1770,6 +2292,62 @@ func (m Model) rightView(w int) string {
 	return border.Width(w).Height(m.mainBoxH() - 2).Render(strings.TrimRight(clipBlock(b.String(), innerW), "\n"))
 }
 
+func (m Model) optionsView() string {
+	outerW := clamp(m.w-8, 64, 104)
+	bodyH := 24
+	innerW := max(40, outerW-4)
+	var b strings.Builder
+	b.WriteString(brand.Render(" More Options ") + "\n")
+	b.WriteString(muted.Render("j/k choose | Space/Enter run or toggle | Esc back") + "\n")
+	checkbox := func(on bool) string {
+		if on {
+			return "[X]"
+		}
+		return "[ ]"
+	}
+	type optionItem struct{ label, kind string }
+	items := []optionItem{
+		{"Vacuum - compact live DB. Keeps request/usage logs.", "danger"},
+		{"Reindex - rebuild indexes for busted DB vibes.", "danger"},
+		{"Run Autobackup now - replace data.sqlite.bak-auto", "action"},
+		{checkbox(m.autoBackupMethod == repo.BackupCopyNone) + " Method: none (default)", "check"},
+		{checkbox(m.autoBackupMethod == repo.BackupCopyVacuum) + " Method: vacuum backup copy", "check"},
+		{checkbox(m.autoBackupMethod == repo.BackupCopyVacuumCleanup) + " Method: vacuum + cleanup backup copy", "check"},
+		{"Run Snapshot now - replace data.sqlite.bak-snap", "action"},
+		{checkbox(m.snapBackupMethod == repo.BackupCopyNone) + " Method: none", "check"},
+		{checkbox(m.snapBackupMethod == repo.BackupCopyVacuum) + " Method: vacuum backup copy", "check"},
+		{checkbox(m.snapBackupMethod == repo.BackupCopyVacuumCleanup) + " Method: vacuum + cleanup backup copy", "check"},
+	}
+	section := func(title string) { b.WriteString("\n" + optionsRule.Render("── "+title+" ") + "\n") }
+	section("Main actions")
+	for i, it := range items {
+		if i == 3 {
+			section("Autobackup options")
+		}
+		if i == 7 {
+			section("Snapshot options")
+		}
+		cur := "  "
+		text := it.label
+		if it.kind == "danger" {
+			text = dangerAction.Render(text)
+		}
+		line := text
+		if i == m.optionCursor {
+			cur = "▸ "
+			line = sel.Render(clipLine(cur+text, innerW))
+		} else {
+			line = clipLine(cur+text, innerW)
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("\n" + muted.Render("Metadata stores created_at/method. Single file replaced, no backup spam.") + "\n")
+	if m.vacuumMsg != "" {
+		b.WriteString(ok.Render(" "+m.vacuumMsg+" ") + "\n")
+	}
+	return box.Width(outerW).Height(bodyH).Render(b.String())
+}
+
 func (m Model) backupView() string {
 	outerW := max(60, m.w-2)
 	bodyH := max(12, m.h-6)
@@ -1797,7 +2375,7 @@ func (m Model) backupListContent(innerW, innerH int) string {
 	} else {
 		b.WriteString(clipLine(muted.Render(" no undo logs"), innerW) + "\n")
 	}
-	b.WriteString(clipLine(muted.Render(" R restore  C clean+VACUUM  F snapshot  Esc back"), innerW) + "\n")
+	b.WriteString(clipLine(muted.Render(" R restore  F snapshot  / options  Esc back"), innerW) + "\n")
 
 	nameW := max(10, innerW-18)
 	b.WriteString(importHead.Render(clipLine(fmt.Sprintf(" %-*s %5s %-7s", nameW, "UNDO LOG", "ACCTS", "SIZE"), innerW)) + "\n")
@@ -1902,33 +2480,186 @@ func (m Model) importProviderView() string {
 	if len(ps) == 0 {
 		ps = importProviderOptions()
 	}
+	outerW := clamp(m.w-6, 86, max(86, m.w-6))
+	innerW := max(40, outerW-6)
 	var b strings.Builder
-	b.WriteString(brand.Render(" Import Provider ") + "\n")
-	b.WriteString(muted.Render(" choose provider before loading import rows") + "\n\n")
-	b.WriteString(importHead.Render(fmt.Sprintf("%-3s %-16s %-44s %s", "", "PROVIDER", "MODE", "SOURCE")) + "\n")
+	b.WriteString(brand.Render(" Import Accounts ") + "\n")
+	b.WriteString(muted.Render("Manual opens paste popup. JSON imports use file picker.") + "\n\n")
+	section := func(s string) {
+		b.WriteString(optionsRule.Render("── "+s+" "+strings.Repeat("─", max(0, innerW-len(s)-4))) + "\n")
+	}
+	render := func(i int, p importProviderOption) {
+		cur := "  "
+		if i == m.importProviderCur {
+			cur = "| "
+		}
+		kind := "JSON"
+		if p.ID == "manual" {
+			kind = "PASTE"
+		} else if p.ID == "all" {
+			kind = "ALL JSON"
+		}
+		label := fmt.Sprintf("%s%-18s  %-8s  %s", cur, trim(p.Label, 18), kind, trim(p.Description, max(12, innerW-34)))
+		if p.ID == "manual" {
+			label = warnChip.Render(label)
+		} else if i == m.importProviderCur {
+			label = sel.Render(label)
+		} else {
+			label = subtle.Render(label)
+		}
+		b.WriteString(clipLine(label, innerW) + "\n")
+	}
+	section("MANUAL INPUT")
 	for i, p := range ps {
-		mark := " "
-		if i == m.importProviderCur {
-			mark = "▸"
+		if p.ID == "manual" {
+			render(i, p)
 		}
-		state := ok.Render("ready")
-		if !p.Ready {
-			state = inactive.Render("disabled")
+	}
+	section("JSON IMPORT")
+	for i, p := range ps {
+		if p.ID != "manual" {
+			render(i, p)
 		}
-		line := fmt.Sprintf("%s  %-16s %-44s %-50s %s", mark, trim(p.Label, 16), trim(p.Description, 44), trim(p.Source, 50), state)
-		if !p.Ready {
-			line = muted.Render(line)
-		}
-		if i == m.importProviderCur {
-			line = sel.Render(line)
-		}
-		b.WriteString(line + "\n")
 	}
 	if len(ps) == 0 {
 		b.WriteString(empty.Render("\n  no import providers configured\n"))
 	}
-	b.WriteString("\n" + muted.Render(" j/k move  gg/G jump  Enter/i choose  Esc back  Ctrl+Q quit"))
-	return centered(m.w, box.Width(max(104, m.w-6)).Render(b.String()))
+	b.WriteString("\n" + muted.Render("j/k move | Enter choose | Esc back"))
+	return centered(m.w, box.Width(outerW).Render(b.String()))
+}
+
+func (m Model) manualImportView() string {
+	ps := manualProviderIDs()
+	if len(ps) == 0 {
+		ps = []string{"kiro"}
+	}
+	cur := clamp(m.manualProviderCur, 0, len(ps)-1)
+	outerW := 72
+	innerW := 64
+	var b strings.Builder
+	b.WriteString(centerText(brand.Render(" Manual Input "), innerW) + "\n")
+	b.WriteString(centerText(muted.Render("name|refreshtoken per line"), innerW) + "\n\n")
+	b.WriteString(centerText(brand.Render("PROVIDER"), innerW) + "\n")
+	selectedProvider := importProviderLabel(ps[cur])
+	providerBox := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("63")).Width(21).Align(lipgloss.Center).Render(trim(selectedProvider, 17))
+	b.WriteString(centerText(providerBox, innerW) + "\n")
+	b.WriteString("\n")
+	textView := manualInputBox(m.manualText, m.manualCursor, innerW-4, 10, m.manualField == 2)
+	pasteBorder := lipgloss.Color("240")
+	if m.manualField == 2 {
+		pasteBorder = lipgloss.Color("63")
+	}
+	pasteBox := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(pasteBorder).Width(innerW).Render(textView)
+	b.WriteString(pasteBox + "\n")
+	if m.manualMsg != "" {
+		b.WriteString(ok.Render(" "+clipLine(m.manualMsg, innerW-2)+" ") + "\n")
+	}
+	b.WriteString(muted.Render("Tab field  ^J newline  ^S/Enter import  Esc back"))
+	return box.Width(outerW).Render(b.String())
+}
+
+func (m Model) manualProviderPopupView() string {
+	ps := manualProviderIDs()
+	if len(ps) == 0 {
+		ps = []string{"kiro"}
+	}
+	cur := clamp(m.manualProviderCur, 0, len(ps)-1)
+	innerW := 28
+	start := clamp(cur-4, 0, max(0, len(ps)-9))
+	end := min(len(ps), start+9)
+	var b strings.Builder
+	b.WriteString(centerText(brand.Render("PROVIDERS"), innerW) + "\n")
+	for i := start; i < end; i++ {
+		mark := "  "
+		if i == cur {
+			mark = "| "
+		}
+		line := clipLine(mark+importProviderLabel(ps[i]), innerW)
+		if i == cur {
+			line = sel.Render(line)
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString(muted.Render("j/k move  Enter pick"))
+	return box.Width(innerW + 6).Render(b.String())
+}
+
+func centerText(s string, w int) string {
+	return lipgloss.PlaceHorizontal(w, lipgloss.Center, s)
+}
+
+func manualInputBox(text string, cursor, w, h int, focused bool) string {
+	placeholder := text == ""
+	if text == "" {
+		text = "name|refreshtoken"
+	}
+	cursor = clamp(cursor, 0, len(text))
+	lineIdx, col := manualCursorLineCol(text, cursor)
+	lines := strings.Split(text, "\n")
+	startY := clamp(lineIdx-h/2, 0, max(0, len(lines)-h))
+	lineStartPos := 0
+	for i := 0; i < startY && i < len(lines); i++ {
+		lineStartPos += len(lines[i]) + 1
+	}
+	maxCol := 0
+	if lineIdx < len(lines) {
+		maxCol = len(lines[lineIdx])
+	}
+	startX := 0
+	if col >= w {
+		startX = col - w + 1
+	}
+	if startX > maxCol {
+		startX = max(0, maxCol-w+1)
+	}
+	var b strings.Builder
+	for row := 0; row < h; row++ {
+		i := startY + row
+		line := ""
+		if i < len(lines) {
+			line = lines[i]
+		}
+		view := ""
+		if startX < len(line) {
+			view = line[startX:min(len(line), startX+w)]
+		}
+		if focused && i == lineIdx {
+			c := col - startX
+			if c >= 0 && c <= w {
+				if c >= len(view) {
+					view += "▌"
+				} else {
+					view = view[:c] + "▌" + view[c+1:]
+				}
+			}
+		}
+		if placeholder {
+			view = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(view)
+		}
+		b.WriteString(padRightANSI(view, w) + "\n")
+	}
+	_ = lineStartPos
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func manualCursorLineCol(s string, cursor int) (int, int) {
+	cursor = clamp(cursor, 0, len(s))
+	line, last := 0, 0
+	for i := 0; i < cursor; i++ {
+		if s[i] == '\n' {
+			line++
+			last = i + 1
+		}
+	}
+	return line, cursor - last
+}
+
+func padRightANSI(s string, w int) string {
+	plain := ansi.StringWidth(s)
+	if plain >= w {
+		return clipLine(s, w)
+	}
+	return s + strings.Repeat(" ", w-plain)
 }
 
 func (m Model) importView() string {
@@ -2135,16 +2866,23 @@ func kill9RouterProcess() {
 	_ = exec.Command("pkill", "-f", "9router").Run()
 }
 
+func (m Model) indexConfirmView() string {
+	var b strings.Builder
+	b.WriteString(warnChip.Render(" ⚠ Indexing / REINDEX ") + "\n\n")
+	b.WriteString("This will force-stop 9Router first.\n")
+	b.WriteString("Linux: pkill -9 9router\nWindows: taskkill /f /im node.exe\n")
+	b.WriteString("Backup goes to .9router/db/backup after indexing, so it stays compact/current.\n\n")
+	b.WriteString("Proceed?\n\n")
+	b.WriteString(warnChip.Render(" Y/Enter ") + "  confirm    " + muted.Render("N/Esc") + "  cancel")
+	return vacuumBox.Render(b.String())
+}
+
 func (m Model) vacuumConfirmView() string {
 	var b strings.Builder
-	if m.vacuum9RRunning {
-		b.WriteString(warnChip.Render(" ⚠ 9Router is running ") + "\n\n")
-		b.WriteString("VACUUM requires exclusive DB lock.\n")
-		b.WriteString("Will kill running 9router process → backup → VACUUM. Restart 9router manually after.\n\n")
-	} else {
-		b.WriteString(okChip.Render(" 9Router not running ") + "\n\n")
-		b.WriteString("Clean request/usage logs + VACUUM database.\n\n")
-	}
+	b.WriteString(warnChip.Render(" ⚠ Vacuum ") + "\n\n")
+	b.WriteString("This will force-stop 9Router first and needs exclusive DB lock.\n")
+	b.WriteString("Linux: pkill -9 9router\nWindows: taskkill /f /im node.exe\n")
+	b.WriteString("Backup goes to .9router/db/backup after vacuum, so it stays compact/current.\n\n")
 	b.WriteString("Proceed?\n\n")
 	b.WriteString(warnChip.Render(" Y/Enter ") + "  confirm    " + muted.Render("N/Esc") + "  cancel")
 	return vacuumBox.Render(b.String())
@@ -2162,21 +2900,47 @@ func (m Model) restoreConfirmView() string {
 	return restoreBox.Render(b.String())
 }
 
-func (m Model) vacuumCmd() tea.Cmd {
+func (m Model) snapshotCmd() tea.Cmd {
+	method := m.snapBackupMethod
 	return func() tea.Msg {
-		need9R := m.vacuum9RRunning
-		if need9R {
-			kill9RouterProcess()
-			time.Sleep(2 * time.Second)
-		}
-		s, err := m.r.CleanVacuum()
-		if need9R {
-			s += "; 9router was stopped, rerun 9router manually"
-		}
+		p, err := m.r.Snapshot(method)
 		if err != nil {
 			return vacuumDoneMsg{err: err}
 		}
-		return vacuumDoneMsg{result: s}
+		return vacuumDoneMsg{result: fmt.Sprintf("snap backup: %s (%s)", p, method)}
+	}
+}
+
+func (m Model) autoBackupCmd() tea.Cmd {
+	method := m.autoBackupMethod
+	return func() tea.Msg {
+		p, err := m.r.EnsureDailyBackupWithMethod(method)
+		if err != nil {
+			return vacuumDoneMsg{err: err}
+		}
+		return vacuumDoneMsg{result: fmt.Sprintf("auto backup: %s (%s)", p, method)}
+	}
+}
+
+func (m Model) indexCmd() tea.Cmd {
+	method := m.snapBackupMethod
+	return func() tea.Msg {
+		s, err := m.r.ReindexWithBackup(method)
+		if err != nil {
+			return vacuumDoneMsg{err: err}
+		}
+		return vacuumDoneMsg{result: s + "; restart 9router manually"}
+	}
+}
+
+func (m Model) vacuumCmd() tea.Cmd {
+	method := m.snapBackupMethod
+	return func() tea.Msg {
+		s, err := m.r.VacuumWithBackup(method)
+		if err != nil {
+			return vacuumDoneMsg{err: err}
+		}
+		return vacuumDoneMsg{result: s + "; restart 9router manually"}
 	}
 }
 func summaryRow(x domain.BackupInfo, active bool, label string) string {
@@ -2905,6 +3669,8 @@ var (
 	failChip           = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("166"))
 	errChip            = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("160"))
 	warnChip           = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("94"))
+	dangerAction       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
+	optionsRule        = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	pane               = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("238")).Padding(0, 1).MarginRight(0)
 	focusPane          = pane.BorderForeground(lipgloss.Color("63"))
 	sel                = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("62"))
