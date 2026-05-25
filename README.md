@@ -4,7 +4,9 @@
 >> 9rtui reads the local 9Router SQLite database,shows accounts in a TUI, supports import/export JSON, delete/restore undo logs, and maintenance actions.
 ---
 ## Preview 🖥️
-<img width="1920" height="971" alt="image" src="https://github.com/user-attachments/assets/c9fb3e3c-d876-40ef-8a91-db1552063e4a" />
+<img width="1920" height="auto" alt="image" src="https://github.com/user-attachments/assets/c9fb3e3c-d876-40ef-8a91-db1552063e4a" />
+<img width="1920" height="auto" alt="image" src="https://github.com/user-attachments/assets/1bfbbb34-de3f-4d97-8125-0a922abce24c" />
+
 
 ---
 
