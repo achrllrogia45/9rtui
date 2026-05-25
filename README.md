@@ -1,8 +1,12 @@
 # 9rtui
 
-Terminal UI and helper tools for managing local 9Router account rows.
+> Terminal UI and helper tools for managing local 9Router account rows.
+>> 9rtui reads the local 9Router SQLite database,shows accounts in a TUI, supports import/export JSON, delete/restore undo logs, and maintenance actions.
+---
+## Preview 🖥️
+<img width="1920" height="971" alt="image" src="https://github.com/user-attachments/assets/c9fb3e3c-d876-40ef-8a91-db1552063e4a" />
 
-9rtui reads the local 9Router SQLite database, shows accounts in a TUI, supports import/export JSON, delete/restore undo logs, and maintenance actions.
+---
 
 ## Install
 
@@ -27,12 +31,12 @@ Installers download prebuilt single binaries by default and install into:
 
 ```text
 .9rtui/
-  9rtui / 9rtui.exe
-  9rtui.ini
-  .env
-  .accounts/
-  .tui-logs/
-  scripts/
+├── 9rtui / 9rtui.exe
+├── 9rtui.ini
+├── .env
+├── .accounts/
+├── .tui-logs/
+└── scripts/
 ```
 
 `9rtui.ini` default:
